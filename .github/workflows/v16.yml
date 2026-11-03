@@ -1,0 +1,149 @@
+name: APEX Bot v16
+
+on:
+  schedule:
+    # 4 signal checks / jam selama window London+NY (06:00–21:00 UTC, Sen–Jum)
+    # Killzone internal script akan filter lebih lanjut (07–10 London, 08–11 & 13–16 NY)
+    - cron: "2,17,32,47 6-21 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "run"
+        type: choice
+        options:
+          - run
+          - smoke
+          - selftest
+          - test-tg
+      live_override:
+        description: "Force LIVE (bypass DRY_RUN untuk run ini saja)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: apex-bot-v16
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15          # v15: 10 — ML v16 lebih berat (purging + triple-barrier)
+    env:
+      TZ: UTC
+
+      # ── Secrets ────────────────────────────────────────────
+      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+      TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+      GIST_ID:             ${{ secrets.GIST_ID }}
+      GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
+      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # opsional
+
+      # ── Kill switch & mode (repo VARIABLES, bukan secrets) ─
+      APEX_KILL:    ${{ vars.APEX_KILL || 'false' }}
+      APEX_DRY_RUN: ${{ github.event.inputs.live_override == 'true' && 'false' || (vars.APEX_DRY_RUN || 'true') }}
+
+      # ── Akun & Risk ────────────────────────────────────────
+      APEX_ACCOUNT_BALANCE:            "1000"
+      APEX_MAX_RISK_PCT_PER_TRADE:     "2.0"      # turunkan ke 0.5 untuk 20 trade pertama
+      APEX_HARD_LEVERAGE_CAP:          "50"
+      APEX_MAX_DAILY_LOSS_PCT:         "4.0"
+      APEX_MAX_CONSECUTIVE_LOSSES:     "3"
+      APEX_MAX_DAILY_SIGNALS:          "5"
+      APEX_DD_PAUSE_HOURS:             "24"
+
+      # ── Data ───────────────────────────────────────────────
+      APEX_M5_FETCH_SIZE:              "800"      # TD free-tier safe cap (fix D-2)
+      APEX_MIN_BARS_M5:                "100"
+      APEX_MIN_BARS_H1:                "100"
+      APEX_MIN_BARS_H4:                "50"
+      APEX_MAX_STALE_MULT:             "3.0"
+      APEX_MT5_OFFSET:                 "0.0"
+
+      # ── Parliament ─────────────────────────────────────────
+      APEX_ADX_MIN:                    "22.0"
+      APEX_PARLIAMENT_MIN_ACTIVE:      "8"
+      APEX_PARLIAMENT_MIN_RATIO:       "0.55"
+      APEX_PARLIAMENT_HALF_RATIO:      "0.65"
+      APEX_PARLIAMENT_FULL_RATIO:      "0.75"
+
+      # ── ML (v16 baru) ──────────────────────────────────────
+      APEX_ML_USE_TRIPLE_BARRIER:      "true"
+      APEX_ML_PURGE_BARS:              "10"
+      APEX_ML_MIN_VAL_ACC:             "0.53"
+
+      # ── News blackout ──────────────────────────────────────
+      APEX_NEWS_BLACKOUT_MIN:          "30"
+      APEX_NEWS_CACHE_SEC:             "1800"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Selftest (fail-fast)
+        run: python apex_v16.py selftest
+
+      - name: Telegram connectivity
+        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'test-tg' || github.event.inputs.mode == 'run'
+        run: python apex_v16.py test-tg
+
+      - name: Smoke test (parliament dry analysis)
+        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'run'
+        run: python apex_v16.py smoke
+
+      - name: Production run
+        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'run'
+        run: python apex_v16.py run
+
+      - name: Journal snapshot
+        if: always()
+        run: |
+          python - <<'PYEOF' || true
+          import os, json, requests
+          gid = os.getenv("GIST_ID", "").strip()
+          tok = os.getenv("GIST_TOKEN", "").strip()
+          if not gid or not tok:
+              print("No Gist configured - local only")
+              raise SystemExit(0)
+          try:
+              r = requests.get(
+                  f"https://api.github.com/gists/{gid}",
+                  headers={"Authorization": f"Bearer {tok}"},
+                  timeout=10,
+              )
+              files = r.json().get("files", {})
+              if "apex_state.json" not in files:
+                  print("No state file in Gist")
+                  raise SystemExit(0)
+              st = json.loads(files["apex_state.json"]["content"])
+              j = st.get("journal", [])
+              print(f"=== JOURNAL ({len(j)} entries) ===")
+              for e in j[:10]:
+                  print(
+                      f"  {e.get('timestamp','?'):19s} {e.get('signal','?'):4s} "
+                      f"{e.get('outcome','?'):12s} "
+                      f"filled={e.get('filled','?')} "
+                      f"R={float(e.get('r_achieved',0) or 0):+.2f} "
+                      f"lot={e.get('lot','?')}"
+                  )
+          except Exception as ex:
+              print(f"Snapshot error: {ex}")
+          PYEOF
