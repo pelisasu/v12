@@ -279,25 +279,37 @@ def fetch_twelvedata(cfg, offset):
     key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     if not key: raise DataFetchError("No TD key")
     size = min(cfg.m5_fetch_size, 800)
-    r = _request_with_retry(cfg, "GET", "https://api.twelvedata.com/time_series",
-        params={"symbol":"XAU/USD","interval":"5min","outputsize":size,
-                "apikey":key,"timezone":"UTC"})
-    d = r.json()
-    if "values" not in d or not d["values"]:
-        raise DataFetchError(f"TD: {d.get('message','no values')}")
-    df = pd.DataFrame(d["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    for c in ("open","high","low","close"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["volume"] = 100.0
-    df = df.dropna(subset=["open","high","low","close"]).sort_values("datetime").reset_index(drop=True)
-    _validate_df(df, "TD-M5", cfg.min_bars_m5, cfg)
-    _check_staleness(df, cfg)
+    
+    def _fetch_tf(interval, outputsize):
+        r = _request_with_retry(cfg, "GET", "https://api.twelvedata.com/time_series",
+            params={"symbol":"XAU/USD","interval":interval,"outputsize":outputsize,
+                    "apikey":key,"timezone":"UTC"})
+        d = r.json()
+        if "values" not in d or not d["values"]:
+            raise DataFetchError(f"TD {interval}: {d.get('message','no values')}")
+        df = pd.DataFrame(d["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        for c in ("open","high","low","close"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["volume"] = 100.0
+        df = df.dropna(subset=["open","high","low","close"]).sort_values("datetime").reset_index(drop=True)
+        return _apply_offset(df, offset)
+
+    # Fetch langsung per time-frame (3 API calls)
+    m5 = _fetch_tf("5min", size)
+    h1 = _fetch_tf("1h", 800)
+    h4 = _fetch_tf("4h", 800)
+
+    _validate_df(m5, "TD-M5", cfg.min_bars_m5, cfg)
+    _validate_df(h1, "TD-H1", cfg.min_bars_h1, cfg)
+    _validate_df(h4, "TD-H4", cfg.min_bars_h4, cfg)
+    _check_staleness(m5, cfg)
+
     return {
-        "5min": _apply_offset(df, offset),
-        "15min": _apply_offset(resample_ohlc(df, "15min"), offset),
-        "1h": _apply_offset(resample_ohlc(df, "1h"), offset),
-        "4h": _apply_offset(resample_ohlc(df, "4h"), offset),
+        "5min": m5,
+        "15min": _apply_offset(resample_ohlc(m5, "15min"), offset),
+        "1h": h1,
+        "4h": h4,
     }, "TwelveData"
 
 def fetch_yahoo(cfg, offset):
