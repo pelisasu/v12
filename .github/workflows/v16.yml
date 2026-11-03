@@ -2,11 +2,7 @@ name: APEX Bot v16
 
 on:
   schedule:
-    # 4 signal checks / jam selama window London+NY (06:00–21:00 UTC, Sen–Jum)
-    # Killzone internal script akan filter lebih lanjut
-    # (07–10 London, 08–11 & 13–16 NY)
     - cron: "2,17,32,47 6-21 * * 1-5"
-
   workflow_dispatch:
     inputs:
       mode:
@@ -20,7 +16,7 @@ on:
           - selftest
           - test-tg
       live_override:
-        description: "Force LIVE (bypass DRY_RUN untuk run ini saja)"
+        description: "Force LIVE (bypass DRY_RUN)"
         required: false
         default: false
         type: boolean
@@ -35,82 +31,81 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15          # ML v16 + triple-barrier + retry HTTP
+    timeout-minutes: 15
     env:
       TZ: UTC
 
-      # ── Secrets ────────────────────────────────────────────
       TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
       TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       GIST_ID:             ${{ secrets.GIST_ID }}
       GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
-      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # opsional (offset dinamis)
+      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}
 
-      # ── Kill switch & mode (repo VARIABLES) ────────────────
       APEX_KILL:    ${{ vars.APEX_KILL || 'false' }}
       APEX_DRY_RUN: ${{ github.event.inputs.live_override == 'true' && 'false' || (vars.APEX_DRY_RUN || 'true') }}
 
-      # ── Akun & Risk ────────────────────────────────────────
+      # ── Akun & Risk ──
       APEX_ACCOUNT_BALANCE:        "1000"
-      APEX_MAX_RISK_PCT_PER_TRADE: "2.0"      # turunkan ke 0.5 untuk 20 trade pertama
+      APEX_MAX_RISK_PCT_PER_TRADE: "2.0"
       APEX_HARD_LEVERAGE_CAP:      "50"
       APEX_MAX_DAILY_LOSS_PCT:     "4.0"
       APEX_MAX_CONSECUTIVE_LOSSES: "3"
       APEX_MAX_DAILY_SIGNALS:      "5"
       APEX_DD_PAUSE_HOURS:         "24"
 
-      # ── ATR SL/TP (matematika risiko) ──────────────────────
-      APEX_ATR_SL_MULT:    "1.8"
-      APEX_ATR_TP1_MULT:   "1.0"
-      APEX_ATR_TP2_MULT:   "2.4"
-      APEX_ATR_TP3_MULT:   "4.0"
-      APEX_SPREAD_BUFFER:  "0.35"
+      # ── ATR SL/TP ──
+      APEX_ATR_SL_MULT:   "1.8"
+      APEX_ATR_TP1_MULT:  "1.0"
+      APEX_ATR_TP2_MULT:  "2.4"
+      APEX_ATR_TP3_MULT:  "4.0"
+      APEX_SPREAD_BUFFER: "0.35"
 
-      # ── Entry limit semantics ──────────────────────────────
-      APEX_ENTRY_PULLBACK_ATR: "0.30"
+      # ── Entry ──
+      APEX_ENTRY_PULLBACK_ATR:  "0.30"
       APEX_ENTRY_MAX_CHASE_ATR: "3.0"
 
-      # ── Data ───────────────────────────────────────────────
-      APEX_M5_FETCH_SIZE:   "800"      # TD free-tier safe cap
-      APEX_MIN_BARS_M5:     "100"
-      APEX_MIN_BARS_M15:    "100"
-      APEX_MIN_BARS_H1:     "100"
-      APEX_MIN_BARS_H4:     "50"
-      APEX_MAX_STALE_MULT:  "3.0"
-      APEX_MT5_OFFSET:      "0.0"
-      APEX_PRICE_MIN:       "500.0"
-      APEX_PRICE_MAX:       "10000.0"
+      # ── Data ──
+      APEX_M5_FETCH_SIZE:      "800"
+      APEX_MIN_BARS_M5:        "100"
+      APEX_MIN_BARS_M15:       "100"
+      APEX_MIN_BARS_H1:        "100"
+      APEX_MIN_BARS_H4:        "50"
+      APEX_MAX_STALE_MULT:     "3.0"
+      APEX_MT5_OFFSET:         "0.0"
+      APEX_PRICE_MIN:          "500.0"
+      APEX_PRICE_MAX:          "10000.0"
       APEX_PRICE_MAX_JUMP_PCT: "0.10"
 
-      # ── Parliament ─────────────────────────────────────────
-      APEX_ADX_MIN:                  "22.0"
-      APEX_PARLIAMENT_MIN_ACTIVE:    "8"
-      APEX_PARLIAMENT_MIN_RATIO:     "0.55"
-      APEX_PARLIAMENT_HALF_RATIO:    "0.65"
-      APEX_PARLIAMENT_FULL_RATIO:    "0.75"
-      APEX_HURST_TREND_MIN:          "0.55"
-      APEX_HURST_MEANREV_MAX:        "0.45"
-      APEX_ENTROPY_CHAOS_MAX:        "0.85"
+      # ── Parliament + Regime ──
+      APEX_ADX_MIN:               "22.0"
+      APEX_ADX_TREND_OVERRIDE:    "35.0"     # NEW: trend kuat menembus Hurst netral
+      APEX_PARLIAMENT_MIN_ACTIVE: "8"
+      APEX_PARLIAMENT_MIN_RATIO:  "0.55"
+      APEX_PARLIAMENT_HALF_RATIO: "0.65"
+      APEX_PARLIAMENT_FULL_RATIO: "0.75"
+      APEX_HURST_TREND_MIN:       "0.53"
+      APEX_HURST_MEANREV_MAX:     "0.47"
+      APEX_ENTROPY_CHAOS_MAX:     "0.85"
 
-      # ── Cooldown ───────────────────────────────────────────
+      # ── Cooldown ──
       APEX_COOLDOWN_MINUTES:          "45"
       APEX_OPPOSITE_COOLDOWN_MINUTES: "120"
 
-      # ── ML (v16) ───────────────────────────────────────────
+      # ── ML ──
       APEX_ML_USE_TRIPLE_BARRIER: "true"
       APEX_ML_PURGE_BARS:         "10"
       APEX_ML_MIN_VAL_ACC:        "0.53"
 
-      # ── News blackout ──────────────────────────────────────
+      # ── News ──
       APEX_NEWS_BLACKOUT_MIN:      "30"
       APEX_NEWS_CACHE_SEC:         "1800"
       APEX_NEWS_CACHE_SEC_ON_FAIL: "300"
 
-      # ── Journal / HTTP ─────────────────────────────────────
-      APEX_MAX_JOURNAL:          "500"
+      # ── Journal ──
+      APEX_MAX_JOURNAL:           "500"
       APEX_PENDING_MAX_AGE_HOURS: "24"
-      APEX_MAX_RETRY:            "3"
+      APEX_MAX_RETRY:             "3"
 
     steps:
       - name: Checkout
@@ -134,7 +129,7 @@ jobs:
         if: github.event.inputs.mode == '' || github.event.inputs.mode == 'test-tg' || github.event.inputs.mode == 'run'
         run: python apex_v16.py test-tg
 
-      - name: Smoke test (parliament dry analysis)
+      - name: Smoke test
         if: github.event.inputs.mode == '' || github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'run'
         run: python apex_v16.py smoke
 
@@ -150,7 +145,7 @@ jobs:
           gid = os.getenv("GIST_ID", "").strip()
           tok = os.getenv("GIST_TOKEN", "").strip()
           if not gid or not tok:
-              print("No Gist configured - local only")
+              print("No Gist configured")
               raise SystemExit(0)
           try:
               r = requests.get(
@@ -160,7 +155,7 @@ jobs:
               )
               files = r.json().get("files", {})
               if "apex_state.json" not in files:
-                  print("No state file in Gist")
+                  print("No state file")
                   raise SystemExit(0)
               st = json.loads(files["apex_state.json"]["content"])
               j = st.get("journal", [])
@@ -168,10 +163,8 @@ jobs:
               for e in j[:10]:
                   print(
                       f"  {e.get('timestamp','?'):19s} {e.get('signal','?'):4s} "
-                      f"{e.get('outcome','?'):12s} "
-                      f"filled={e.get('filled','?')} "
-                      f"R={float(e.get('r_achieved',0) or 0):+.2f} "
-                      f"lot={e.get('lot','?')}"
+                      f"{e.get('outcome','?'):12s} filled={e.get('filled','?')} "
+                      f"R={float(e.get('r_achieved',0) or 0):+.2f} lot={e.get('lot','?')}"
                   )
           except Exception as ex:
               print(f"Snapshot error: {ex}")
