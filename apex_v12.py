@@ -1,8 +1,8 @@
 """
-APEX PREDATOR v12.2 — MULTI-LAYER DATA + MT5 OFFSET
-====================================================
-- 4-tier data fallback: TwelveData -> Yahoo -> Stooq -> AlphaVantage
-- MT5 Offset alignment via APEX_MT5_OFFSET env
+APEX PREDATOR v12.3 — DYNAMIC MT5 OFFSET
+=========================================
+- Otomatis menghitung selisih harga (offset) dari OANDA API (Proxy MT5)
+- Jika OANDA tidak diset, fallback ke offset statis (APEX_MT5_OFFSET)
 """
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "12.2"
+VERSION = "12.3"
 NY = ZoneInfo("America/New_York")
 LONDON = ZoneInfo("Europe/London")
-
 
 # =========================================================
 # CONFIG
@@ -44,7 +43,7 @@ class Config:
     contract_size: float = 100.0
     account_currency: str = "USD"
     price_decimals: int = 3
-    mt5_offset: float = 0.0  # ← NEW: Offset MT5 vs API
+    mt5_offset: float = 0.0  # Fallback statis
 
     account_balance: float = 1000.0
     max_risk_pct_per_trade: float = 2.0
@@ -121,7 +120,7 @@ class Config:
                 logging.warning(f"APEX_{f.upper()}={v!r} invalid")
         cfg.gist_id = os.getenv("GIST_ID", cfg.gist_id).strip()
         cfg.gist_token = os.getenv("GIST_TOKEN", cfg.gist_token).strip()
-        # Explicit override for MT5 offset
+        
         mt5_off = os.getenv("APEX_MT5_OFFSET", "").strip()
         if mt5_off:
             try:
@@ -173,7 +172,6 @@ def round_half_away(x: float) -> int:
 
 class DataFetchError(Exception): pass
 class StateLoadError(Exception): pass
-
 
 # =========================================================
 # KVStore
@@ -237,18 +235,55 @@ class KVStore:
     def force_load(self) -> None:
         self._load_gist() if self.use_gist else self._load_local()
 
+# =========================================================
+# DYNAMIC MT5 OFFSET CALCULATOR (NEW)
+# =========================================================
+def get_dynamic_mt5_offset(cfg: Config) -> float:
+    """Menghitung offset otomatis dengan membandingkan harga OANDA (Proxy MT5) vs TwelveData."""
+    oanda_key = os.getenv("OANDA_API_KEY", "").strip()
+    if not oanda_key:
+        logging.info(f"OANDA_API_KEY tidak diset. Menggunakan offset statis: {cfg.mt5_offset:+.3f}")
+        return cfg.mt5_offset
+        
+    try:
+        # 1. Ambil harga OANDA (Proxy MT5)
+        r_oanda = requests.get(
+            "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/pricing",
+            headers={"Authorization": f"Bearer {oanda_key}"},
+            timeout=5
+        )
+        r_oanda.raise_for_status()
+        oanda_price = float(r_oanda.json()["prices"][0]["bids"][0]["price"])
+
+        # 2. Ambil harga TwelveData Live
+        td_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+        r_td = requests.get(
+            "https://api.twelvedata.com/price",
+            params={"symbol": "XAU/USD", "apikey": td_key},
+            timeout=5
+        )
+        r_td.raise_for_status()
+        td_price = float(r_td.json()["price"])
+
+        # 3. Hitung Offset (OANDA - TwelveData)
+        dynamic_offset = round(oanda_price - td_price, 3)
+        logging.info(f"Dynamic Offset Calculated: OANDA={oanda_price}, TD={td_price} → Offset={dynamic_offset:+.3f}")
+        return dynamic_offset
+
+    except Exception as e:
+        logging.warning(f"Gagal hitung dynamic offset ({redact(e)}). Fallback ke statis: {cfg.mt5_offset:+.3f}")
+        return cfg.mt5_offset
 
 # =========================================================
-# DATA FETCHERS (Multi-Layer)
+# DATA FETCHERS (Multi-Layer + Dynamic Offset)
 # =========================================================
-def _apply_offset(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Apply MT5 offset to align prices."""
-    if cfg.mt5_offset != 0.0:
+def _apply_offset(df: pd.DataFrame, offset: float) -> pd.DataFrame:
+    if offset != 0.0:
         for c in ("open", "high", "low", "close"):
-            df[c] = df[c] + cfg.mt5_offset
+            df[c] = df[c] + offset
     return df
 
-def validate_ohlcv(df: pd.DataFrame, interval: str, min_bars: int, cfg: Config) -> pd.DataFrame:
+def validate_ohlcv(df: pd.DataFrame, interval: str, min_bars: int, cfg: Config, offset: float) -> pd.DataFrame:
     if df is None or len(df) < min_bars: raise DataFetchError(f"Bars {0 if df is None else len(df)} < {min_bars}")
     df = df.dropna(subset=["open", "high", "low", "close"]).copy()
     if (df["high"] < df["low"]).any(): raise DataFetchError("high<low")
@@ -257,9 +292,9 @@ def validate_ohlcv(df: pd.DataFrame, interval: str, min_bars: int, cfg: Config) 
     isec = {"5min": 300, "15min": 900, "1h": 3600, "4h": 14400}[interval]
     last_ts = df["datetime"].iloc[-1]
     if (datetime.now(timezone.utc) - last_ts).total_seconds() > isec * cfg.max_stale_mult: raise DataFetchError("Stale")
-    return _apply_offset(df.reset_index(drop=True), cfg)
+    return _apply_offset(df.reset_index(drop=True), offset)
 
-def fetch_twelvedata(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
+def fetch_twelvedata(cfg: Config, offset: float) -> tuple[dict[str, pd.DataFrame], str]:
     key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     if not key: raise DataFetchError("No key")
     def _do():
@@ -274,13 +309,13 @@ def fetch_twelvedata(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
         return df.sort_values("datetime").reset_index(drop=True)
     df = _do()
     return {
-        "5min": validate_ohlcv(df, "5min", cfg.min_bars_m5, cfg),
-        "15min": validate_ohlcv(resample_ohlc(df, "15min"), "15min", cfg.min_bars_m15, cfg),
-        "1h": validate_ohlcv(resample_ohlc(df, "1h"), "1h", cfg.min_bars_h1, cfg),
-        "4h": validate_ohlcv(resample_ohlc(df, "4h"), "4h", cfg.min_bars_h4, cfg),
+        "5min": validate_ohlcv(df, "5min", cfg.min_bars_m5, cfg, offset),
+        "15min": validate_ohlcv(resample_ohlc(df, "15min"), "15min", cfg.min_bars_m15, cfg, offset),
+        "1h": validate_ohlcv(resample_ohlc(df, "1h"), "1h", cfg.min_bars_h1, cfg, offset),
+        "4h": validate_ohlcv(resample_ohlc(df, "4h"), "4h", cfg.min_bars_h4, cfg, offset),
     }, "TwelveData"
 
-def fetch_yahoo(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
+def fetch_yahoo(cfg: Config, offset: float) -> tuple[dict[str, pd.DataFrame], str]:
     headers = {"User-Agent": f"ApexBot/{VERSION}"}
     def _do(symbol, iv, range_):
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", params={"interval": iv, "range": range_}, headers=headers, timeout=cfg.http_timeout)
@@ -300,12 +335,12 @@ def fetch_yahoo(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
         return df[["datetime", "open", "high", "low", "close", "volume"]]
     out = {}
     for iv, cnt, rng, mn in (("5min", 200, "5d", cfg.min_bars_m5), ("15min", 150, "5d", cfg.min_bars_m15), ("1h", 200, "1mo", cfg.min_bars_h1)):
-        out[iv] = validate_ohlcv(_do("XAUUSD=X", {"5min":"5m","15min":"15m","1h":"1h"}[iv], rng), iv, mn, cfg)
+        out[iv] = validate_ohlcv(_do("XAUUSD=X", {"5min":"5m","15min":"15m","1h":"1h"}[iv], rng), iv, mn, cfg, offset)
     df1h = _do("XAUUSD=X", "1h", "1mo")
-    out["4h"] = validate_ohlcv(resample_ohlc(df1h, "4h"), "4h", cfg.min_bars_h4, cfg)
+    out["4h"] = validate_ohlcv(resample_ohlc(df1h, "4h"), "4h", cfg.min_bars_h4, cfg, offset)
     return out, "Yahoo"
 
-def fetch_stooq(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
+def fetch_stooq(cfg: Config, offset: float) -> tuple[dict[str, pd.DataFrame], str]:
     def _do():
         r = requests.get("https://stooq.com/q/d/l/?s=xauusd&i=5", timeout=cfg.http_timeout)
         r.raise_for_status()
@@ -316,43 +351,23 @@ def fetch_stooq(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
         return df.sort_values("datetime").reset_index(drop=True)
     df = _do()
     return {
-        "5min": validate_ohlcv(df, "5min", cfg.min_bars_m5, cfg),
-        "15min": validate_ohlcv(resample_ohlc(df, "15min"), "15min", cfg.min_bars_m15, cfg),
-        "1h": validate_ohlcv(resample_ohlc(df, "1h"), "1h", cfg.min_bars_h1, cfg),
-        "4h": validate_ohlcv(resample_ohlc(df, "4h"), "4h", cfg.min_bars_h4, cfg),
+        "5min": validate_ohlcv(df, "5min", cfg.min_bars_m5, cfg, offset),
+        "15min": validate_ohlcv(resample_ohlc(df, "15min"), "15min", cfg.min_bars_m15, cfg, offset),
+        "1h": validate_ohlcv(resample_ohlc(df, "1h"), "1h", cfg.min_bars_h1, cfg, offset),
+        "4h": validate_ohlcv(resample_ohlc(df, "4h"), "4h", cfg.min_bars_h4, cfg, offset),
     }, "Stooq"
 
-def fetch_alphavantage(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
-    key = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
-    if not key: raise DataFetchError("No AlphaVantage key")
-    def _do():
-        r = requests.get(f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=XAU&to_symbol=USD&interval=5min&outputsize=full&apikey={key}", timeout=cfg.http_timeout)
-        r.raise_for_status()
-        d = r.json()
-        if "Time Series FX (5min)" not in d: raise DataFetchError("AV bad response")
-        df = pd.DataFrame.from_dict(d["Time Series FX (5min)"], orient="index").reset_index()
-        df.rename(columns={"index": "datetime", "1. open": "open", "2. high": "high", "3. low": "low", "4. close": "close"}, inplace=True)
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-        for c in ("open","high","low","close"): df[c] = pd.to_numeric(df[c])
-        df["volume"] = 100.0
-        return df.sort_values("datetime").reset_index(drop=True)
-    df = _do()
-    return {
-        "5min": validate_ohlcv(df, "5min", cfg.min_bars_m5, cfg),
-        "15min": validate_ohlcv(resample_ohlc(df, "15min"), "15min", cfg.min_bars_m15, cfg),
-        "1h": validate_ohlcv(resample_ohlc(df, "1h"), "1h", cfg.min_bars_h1, cfg),
-        "4h": validate_ohlcv(resample_ohlc(df, "4h"), "4h", cfg.min_bars_h4, cfg),
-    }, "AlphaVantage"
-
-def fetch_all_intervals(cfg: Config) -> tuple[dict[str, pd.DataFrame], str]:
+def fetch_all_intervals(cfg: Config) -> tuple[dict[str, pd.DataFrame], str, float]:
     errors = []
-    # 4-Layer Cascade
-    sources = [("TwelveData", fetch_twelvedata), ("Yahoo", fetch_yahoo), ("Stooq", fetch_stooq), ("AlphaVantage", fetch_alphavantage)]
+    # Dapatkan offset dinamis dulu
+    offset = get_dynamic_mt5_offset(cfg)
+    
+    sources = [("TwelveData", fetch_twelvedata), ("Yahoo", fetch_yahoo), ("Stooq", fetch_stooq)]
     for name, fn in sources:
         try:
-            dfs, src = fn(cfg)
-            logging.info(f"Data OK [{src}] (Offset: {cfg.mt5_offset:+.2f})")
-            return dfs, src
+            dfs, src = fn(cfg, offset)
+            logging.info(f"Data OK [{src}] (Offset: {offset:+.3f})")
+            return dfs, src, offset
         except Exception as e:
             errors.append(f"{name}: {redact(e)}")
             logging.warning(f"{name} failed: {redact(e)}")
@@ -362,10 +377,8 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     d = (df.set_index("datetime").resample(rule, label="left", closed="left").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna().reset_index())
     return d.reset_index(drop=True)
 
-
 # =========================================================
-# INDICATORS, SMC, SIGNAL, RISK, TG, ETC. 
-# (SAMA PERSIS DENGAN SEBELUMNYA — TIDAK ADA PERUBAHAN LOGIKA)
+# INDICATORS, SMC, SIGNAL, RISK, TG (SAMA SEPERTI SEBELUMNYA)
 # =========================================================
 def atr(df: pd.DataFrame, period: int = 14) -> float:
     h_, lo, c_ = df["high"], df["low"], df["close"]
@@ -804,7 +817,7 @@ def sanity_price(cfg: Config, price: float, st: dict) -> None:
         ch = abs(price - st["last_price"]) / st["last_price"]
         if ch > cfg.price_max_jump_pct: raise DataFetchError(f"Price jump {ch*100:.1f}%")
 
-def _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, note) -> str:
+def _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, note, offset) -> str:
     p = cfg.price_decimals; c = sig.conf; parts = []
     if sig.ob["detected"]: parts.append(sig.ob["type"] + ("✓swept" if sig.ob["swept"] else ""))
     if sig.choch["detected"]: parts.append(sig.choch["type"])
@@ -816,7 +829,7 @@ def _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, n
             f"R:R(TP1): <code>1:{rr:.2f}</code>\n\nLot: <code>{lot}</code> ({cfg.account_currency}){warn}\n\n"
             f"SMC: <code>{h(smc)}</code>\nHA: <code>{sig.ha}</code> | ADX: <code>{sig.adx:.1f}</code> | RSI: <code>{c.get('rsi', 0)}</code>\n"
             f"Regime: <code>{sig.regime.get('regime', '?')}</code>\nScore: <code>{c.get('total', 0):+d}</code>\n"
-            f"Data: <code>{h(src)}</code> | Offset: <code>{cfg.mt5_offset:+.2f}</code>\n<code>{h(now_str)} UTC</code>\n\n<i>Manual execution MT5. BE after TP1.</i>")
+            f"Data: <code>{h(src)}</code> | Offset: <code>{offset:+.3f}</code>\n<code>{h(now_str)} UTC</code>\n\n<i>Manual execution MT5. BE after TP1.</i>")
 
 def run_once(cfg: Config) -> None:
     kv = KVStore(cfg)
@@ -838,7 +851,7 @@ def run_once(cfg: Config) -> None:
     if not cfg.dry_run and check_news_shield(cfg, kv)[0]: logging.info("News shield"); return
     st = kv.get("state", {}) or {}; run_num = int(st.get("run_count", 0)) + 1
     try:
-        dfs, src = fetch_all_intervals(cfg)
+        dfs, src, offset = fetch_all_intervals(cfg)
         m5 = dfs["5min"]; m15 = dfs["15min"]; h1 = dfs["1h"]; h4 = dfs["4h"]
     except Exception as e:
         circuit_fail(kv); tg_alert_error(cfg, f"Data: {e}", kv); return
@@ -875,7 +888,7 @@ def run_once(cfg: Config) -> None:
         except Exception as e: should = False; blocked_reason = f"risk: {e}"
     tg_ok = False
     if should:
-        msg = _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, lot_note)
+        msg = _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, lot_note, offset)
         jid = f"{now_str.replace(' ', 'T')}_{sig.type}_{lot}_{signal_bar_iso.replace(' ', 'T')}"
         entry = {"id": jid, "timestamp": now_str, "signal_bar_dt": signal_bar_iso, "symbol": cfg.symbol, "signal": sig.type, "entry": round(price, cfg.price_decimals), "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "lot": lot, "confluence": sig.conf, "regime": sig.regime, "outcome": "PENDING", "r_achieved": 0.0, "notify_status": "DRY" if cfg.dry_run else "SENT"}
         if not journal_append(kv, entry, cfg.max_journal): should = False
@@ -884,7 +897,7 @@ def run_once(cfg: Config) -> None:
             if not tg_ok: blocked_reason = blocked_reason or "tg-fail"
             st["last_signal_type"] = sig.type; st["last_signal_ts"] = now_str
     st["run_count"] = run_num; st["last_price"] = price; st["last_price_ts"] = now_str; kv.set("state", st)
-    logging.info(f"Run #{run_num} | {sig.type} | action={action} conf={conf:.0f}% | fired={tg_ok} | src={src}")
+    logging.info(f"Run #{run_num} | {sig.type} | action={action} conf={conf:.0f}% | fired={tg_ok} | src={src} | offset={offset:+.3f}")
 
 # CLI COMMANDS
 def cmd_reports(cfg: Config, limit: int = 20) -> None:
@@ -929,8 +942,8 @@ def cmd_selftest(cfg: Config) -> None:
     print(f"[1/5] Persistence: {'Gist' if kv.use_gist else 'LOCAL'}")
     if is_ci and not kv.use_gist: failed.append("Gist not configured")
     print("\n[2/5] Secrets:")
-    td = bool(os.getenv("TWELVE_DATA_API_KEY", "").strip()); tg_tok = bool(os.getenv("TELEGRAM_TOKEN", "").strip()); tg_chat = bool(os.getenv("TELEGRAM_CHAT_ID", "").strip())
-    print(f"  TwelveData: {'✓' if td else '✗'} | Telegram: {'✓' if tg_tok and tg_chat else '✗'}")
+    td = bool(os.getenv("TWELVE_DATA_API_KEY", "").strip()); tg_tok = bool(os.getenv("TELEGRAM_TOKEN", "").strip()); tg_chat = bool(os.getenv("TELEGRAM_CHAT_ID", "").strip()); oanda = bool(os.getenv("OANDA_API_KEY", "").strip())
+    print(f"  TwelveData: {'✓' if td else '✗'} | Telegram: {'✓' if tg_tok and tg_chat else '✗'} | OANDA: {'✓' if oanda else '✗'}")
     if not td or not tg_tok: failed.append("Secrets missing")
     print("\n[3/5] State load:")
     try: kv.force_load(); print("  ✓ OK")
@@ -940,8 +953,8 @@ def cmd_selftest(cfg: Config) -> None:
     except AssertionError as e: failed.append(f"Symmetry: {e}")
     print("\n[5/5] Data fetch:")
     try:
-        dfs, src = fetch_all_intervals(cfg)
-        print(f"  ✓ {src}: M5={len(dfs['5min'])} 4h={len(dfs['4h'])} (Offset: {cfg.mt5_offset:+.2f})")
+        dfs, src, offset = fetch_all_intervals(cfg)
+        print(f"  ✓ {src}: M5={len(dfs['5min'])} 4h={len(dfs['4h'])} (Offset: {offset:+.3f})")
     except Exception as e: failed.append(f"Data: {e}")
     if failed:
         print(f"\n=== ❌ FAILED ({len(failed)}) ===")
@@ -951,10 +964,10 @@ def cmd_selftest(cfg: Config) -> None:
     sys.exit(0)
 
 def cmd_smoke(cfg: Config) -> None:
-    try: dfs, src = fetch_all_intervals(cfg)
+    try: dfs, src, offset = fetch_all_intervals(cfg)
     except Exception as e: print(f"✗ Data: {e}"); sys.exit(1)
     m5c = dfs["5min"].iloc[:-1].reset_index(drop=True); m15c = dfs["15min"].iloc[:-1].reset_index(drop=True); h1c = dfs["1h"].iloc[:-1].reset_index(drop=True); h4c = dfs["4h"].iloc[:-1].reset_index(drop=True)
-    print(f"Source: {src} | Offset: {cfg.mt5_offset:+.2f}")
+    print(f"Source: {src} | Offset: {offset:+.3f}")
     print(f"Last M5: {m5c.iloc[-1]['datetime']} close={m5c.iloc[-1]['close']:.2f}")
     sig = generate_signal(cfg, m5c, m15c, h1c, h4c)
     print(f"Result: {sig.type} — {sig.skip_reason}")
