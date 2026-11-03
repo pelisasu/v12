@@ -2,9 +2,7 @@ name: APEX Bot v12
 
 on:
   schedule:
-    # :02,:17,:32,:47 — HINDARI :00/:15 (GitHub Actions queue congestion)
-    # 2 menit setelah bar M5 close → bar baru sudah settle di TwelveData
-    # Window UTC mencakup killzone winter + summer
+    # :02,:17,:32,:47 — hindari peak congestion; 2 menit setelah bar close
     - cron: "2,17,32,47 6-10,12-16,17-21 * * 1-5"
   workflow_dispatch:
 
@@ -40,18 +38,13 @@ jobs:
           cache: pip
       - name: Install deps
         run: pip install -r requirements.txt
-
-      # P1: selftest FAIL-FAST (exit code diperbaiki di v12.1)
-      - name: Selftest
+      - name: Selftest (fail-fast)
         run: python apex_v12.py selftest
-
       - name: Run bot
         run: python apex_v12.py run
-
       - name: Journal snapshot
         if: always()
         run: python apex_v12.py reports | head -n 20
-
       - name: Stats snapshot
         if: always()
         run: python apex_v12.py stats || true
