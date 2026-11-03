@@ -2,7 +2,6 @@ name: APEX Bot v17
 
 on:
   schedule:
-    # 4 signal checks / jam selama window London+NY (06:00–21:00 UTC, Sen–Jum)[cite: 2]
     - cron: "2,17,32,47 6-21 * * 1-5"
 
   workflow_dispatch:
@@ -43,7 +42,7 @@ jobs:
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}[cite: 2]
       GIST_ID:             ${{ secrets.GIST_ID }}[cite: 2]
       GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}[cite: 2]
-      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # opsional[cite: 2]
+      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # Opsional[cite: 2]
 
       # ── Kill switch & mode (Atur di GitHub Repo Variables) ─
       APEX_KILL:    ${{ vars.APEX_KILL || 'false' }}[cite: 2]
