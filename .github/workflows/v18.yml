@@ -115,7 +115,7 @@ jobs:
           python apex_v18.py smoke
           echo "::endgroup::"
 
-      # ─── STEP 4 — RUN DRY (news filter DISABLED untuk test) ───
+      # ─── STEP 4 — RUN DRY ───
       - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
         if: github.event.inputs.stage == 'full_validation'
         env:
@@ -133,7 +133,7 @@ jobs:
           APEX_MAX_DAILY_LOSS_PCT:          '3.0'
           APEX_MAX_CONSECUTIVE_LOSSES:      '3'
           APEX_MAX_DAILY_SIGNALS:           '5'
-          APEX_NEWS_BLACKOUT_MIN:           '0'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
           APEX_ENABLE_ML_MODELS:            'true'
           APEX_MT5_OFFSET:                  '0.0'
           APEX_KILL_SWITCH:                 'false'
