@@ -90,6 +90,10 @@ jobs:
       APEX_HURST_MEANREV_MAX:     "0.47"
       APEX_ENTROPY_CHAOS_MAX:     "0.85"
 
+      # ── HTF Weighting ──
+      APEX_HTF_H1_WEIGHT: "2"
+      APEX_HTF_H4_WEIGHT: "1"
+
       # ── Counter-trend reversal mode ──
       APEX_ALLOW_COUNTER_TREND:         "false"
       APEX_COUNTER_TREND_MIN_ADX:       "40.0"
@@ -169,11 +173,14 @@ jobs:
               j = st.get("journal", [])
               print(f"=== JOURNAL ({len(j)} entries) ===")
               for e in j[:10]:
-                  ct = " [CT]" if e.get("counter_trend") else ""
+                  tags = []
+                  if e.get("counter_trend"): tags.append("CT")
+                  if e.get("htf_mixed"): tags.append("MIX")
+                  tag_str = f" [{'/'.join(tags)}]" if tags else ""
                   print(
                       f"  {e.get('timestamp','?'):19s} {e.get('signal','?'):4s} "
                       f"{e.get('outcome','?'):12s} filled={e.get('filled','?')} "
-                      f"R={float(e.get('r_achieved',0) or 0):+.2f} lot={e.get('lot','?')}{ct}"
+                      f"R={float(e.get('r_achieved',0) or 0):+.2f} lot={e.get('lot','?')}{tag_str}"
                   )
           except Exception as ex:
               print(f"Snapshot error: {ex}")
