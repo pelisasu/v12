@@ -101,6 +101,9 @@ class Config:
     entry_pullback_atr: float = 0.30
     entry_max_chase_atr: float = 2.0
     skip_killzone_filter: bool = False
+    h1_cache_minutes: int = 55
+    h4_cache_minutes: int = 220
+    td_min_interval_sec: float = 1.5
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -380,12 +383,14 @@ class Indicators:
 
 
 # ════════════════════════════════════════════════════════════
-# MARKET DATA
+# MARKET DATA HANDLER
 # ════════════════════════════════════════════════════════════
 class MarketDataHandler:
-    def __init__(self, cfg: Config, http: HTTPClient):
+    def __init__(self, cfg: Config, http: HTTPClient, kv: KVStore):
         self.cfg = cfg
         self.http = http
+        self.kv = kv
+        self._last_td_call = 0.0
 
     def _validate(self, df: pd.DataFrame, name: str, min_bars: int) -> None:
         if df is None or len(df) < min_bars:
@@ -460,35 +465,86 @@ class MarketDataHandler:
               .reset_index()
         )
 
+    def _rate_limit_td(self) -> None:
+        elapsed = time.time() - self._last_td_call
+        wait = self.cfg.td_min_interval_sec - elapsed
+        if wait > 0:
+            logging.debug(f"TD rate-limit sleep {wait:.2f}s")
+            time.sleep(wait)
+        self._last_td_call = time.time()
+
+    def _cached_td_fetch(self, interval: str, outputsize: int,
+                         ttl_minutes: int, offset: float) -> pd.DataFrame:
+        cache_key = f"td_cache_{interval}"
+        cache = self.kv.get(cache_key, {}) or {}
+        cache_ts = float(cache.get("ts", 0) or 0)
+        cache_data = cache.get("data")
+
+        if cache_data and ttl_minutes > 0 and (time.time() - cache_ts) < ttl_minutes * 60:
+            age = (time.time() - cache_ts) / 60.0
+            logging.info(f"TD {interval}: cache hit (age {age:.1f}min)")
+            df = pd.DataFrame(cache_data)
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+            for c in ("open", "high", "low", "close", "volume"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return self._apply_offset(df, offset)
+
+        key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+        if not key:
+            raise DataFetchError("no TD key")
+
+        self._rate_limit_td()
+        r = self.http.request(
+            "GET", "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": "XAU/USD", "interval": interval,
+                "outputsize": outputsize, "apikey": key, "timezone": "UTC",
+            },
+        )
+        data = r.json()
+        if "values" not in data or not data["values"]:
+            if cache_data:
+                logging.warning(f"TD {interval}: API failed — using stale cache")
+                df = pd.DataFrame(cache_data)
+                df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+                for c in ("open", "high", "low", "close", "volume"):
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(subset=["open", "high", "low", "close"])
+                df = df.sort_values("datetime").reset_index(drop=True)
+                return self._apply_offset(df, offset)
+            raise DataFetchError(
+                f"TD {interval}: {data.get('message', 'no values')}"
+            )
+
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        for c in ("open", "high", "low", "close"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["volume"] = 100.0
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+
+        cache_copy = df.copy()
+        cache_copy["datetime"] = cache_copy["datetime"].astype(str)
+        self.kv.set(cache_key, {
+            "ts": time.time(),
+            "data": cache_copy[["datetime", "open", "high", "low", "close", "volume"]].to_dict("records"),
+        })
+
+        return self._apply_offset(df, offset)
+
     def _fetch_td(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
         key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
         if not key:
             raise DataFetchError("no TD key")
         size = min(self.cfg.m5_fetch_size, 800)
 
-        def fetch(interval: str, outputsize: int) -> pd.DataFrame:
-            r = self.http.request(
-                "GET", "https://api.twelvedata.com/time_series",
-                params={
-                    "symbol": "XAU/USD", "interval": interval,
-                    "outputsize": outputsize, "apikey": key, "timezone": "UTC",
-                },
-            )
-            data = r.json()
-            if "values" not in data or not data["values"]:
-                raise DataFetchError(f"TD {interval}: {data.get('message', 'no values')}")
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-            for c in ("open", "high", "low", "close"):
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["volume"] = 100.0
-            df = df.dropna(subset=["open", "high", "low", "close"])
-            df = df.sort_values("datetime").reset_index(drop=True)
-            return self._apply_offset(df, offset)
+        m5 = self._cached_td_fetch("5min", size, ttl_minutes=0, offset=offset)
+        h1 = self._cached_td_fetch("1h", 800, ttl_minutes=self.cfg.h1_cache_minutes, offset=offset)
+        h4 = self._cached_td_fetch("4h", 800, ttl_minutes=self.cfg.h4_cache_minutes, offset=offset)
 
-        m5 = fetch("5min", size)
-        h1 = fetch("1h", 800)
-        h4 = fetch("4h", 800)
         self._validate(m5, "TD-M5", self.cfg.min_bars_m5)
         self._validate(h1, "TD-H1", self.cfg.min_bars_h1)
         self._validate(h4, "TD-H4", self.cfg.min_bars_h4)
@@ -500,9 +556,17 @@ class MarketDataHandler:
         return {"5min": m5, "15min": m15, "1h": h1, "4h": h4}, "TwelveData"
 
     def _fetch_yahoo(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
-        headers = {"User-Agent": f"ApexBot/{VERSION}"}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
+        symbol = "GC=F"
 
-        def fetch(symbol: str, iv: str, rng: str) -> pd.DataFrame:
+        def fetch(iv: str, rng: str) -> pd.DataFrame:
             r = self.http.request(
                 "GET", f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
                 params={"interval": iv, "range": rng}, headers=headers,
@@ -538,9 +602,9 @@ class MarketDataHandler:
         out = {}
         for iv, rng in (("5min", "5d"), ("15min", "5d"), ("1h", "1mo")):
             iv_map = {"5min": "5m", "15min": "15m", "1h": "1h"}
-            out[iv] = self._apply_offset(fetch("XAUUSD=X", iv_map[iv], rng), offset)
+            out[iv] = self._apply_offset(fetch(iv_map[iv], rng), offset)
         out["4h"] = self._apply_offset(
-            self._resample(fetch("XAUUSD=X", "1h", "1mo"), "4h"), offset
+            self._resample(fetch("1h", "1mo"), "4h"), offset
         )
         for tf, mins, min_bars in (
             ("5min", 5, self.cfg.min_bars_m5),
@@ -1467,7 +1531,7 @@ class TradingBotOrchestrator:
         self.cfg = cfg
         self.http = HTTPClient(cfg)
         self.kv = KVStore(cfg, self.http)
-        self.data = MarketDataHandler(cfg, self.http)
+        self.data = MarketDataHandler(cfg, self.http, self.kv)
         self.signal = SignalGenerator(cfg)
         self.risk = RiskManagementEngine(cfg, self.kv)
         self.news = NewsSafetyFilter(cfg, self.kv, self.http)
@@ -1682,7 +1746,8 @@ class TradingBotOrchestrator:
 # ════════════════════════════════════════════════════════════
 def cmd_smoke(cfg: Config) -> None:
     http = HTTPClient(cfg)
-    data = MarketDataHandler(cfg, http)
+    kv = KVStore(cfg, http)
+    data = MarketDataHandler(cfg, http, kv)
     signal = SignalGenerator(cfg)
     dfs, src, offset = data.fetch_all()
     m5c = dfs["5min"].iloc[:-1].reset_index(drop=True)
