@@ -1,15 +1,18 @@
 """
-APEX PREDATOR v16.2 — BATTLE READY
-===================================
+APEX PREDATOR v16.3 — FINAL BATTLE READY
+==========================================
 Production-hardened XAUUSD signal engine.
 Object-oriented, fail-safe, fill-aware, no look-ahead.
 
-Fixes v16.2:
+Features v16.3:
   - ADX override: trend M5 kuat menembus Hurst netral
-  - CHAOS voting diagnostic (tidak return 0/20 lagi)
+  - Counter-trend toggle: izinkan reversal dengan lot auto-reduced
+  - CHAOS voting diagnostic
   - All API calls retry + timeout
   - News blackout high-impact USD
   - Fill-aware outcome tracking
+  - Purged train/val + triple-barrier ML
+  - Daily DD lock, consecutive loss lock, news lock
 """
 from __future__ import annotations
 
@@ -37,7 +40,7 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-VERSION = "16.2"
+VERSION = "16.3"
 NY = ZoneInfo("America/New_York")
 LONDON = ZoneInfo("Europe/London")
 
@@ -77,7 +80,7 @@ class Config:
     atr_tp3_mult: float = 4.0
     spread_buffer: float = 0.35
 
-    # Data validation
+    # Data
     min_bars_m5: int = 100
     min_bars_m15: int = 100
     min_bars_h1: int = 100
@@ -94,10 +97,16 @@ class Config:
     parliament_half_ratio: float = 0.65
     parliament_full_ratio: float = 0.75
     adx_min: float = 22.0
-    adx_trend_override: float = 35.0     # NEW v16.2
-    hurst_trend_min: float = 0.53        # tuned
-    hurst_meanrev_max: float = 0.47      # tuned
+    adx_trend_override: float = 35.0
+    hurst_trend_min: float = 0.53
+    hurst_meanrev_max: float = 0.47
     entropy_chaos_max: float = 0.85
+
+    # Counter-trend reversal mode
+    allow_counter_trend: bool = False
+    counter_trend_min_adx: float = 40.0
+    counter_trend_min_consensus: float = 0.80
+    counter_trend_lot_divisor: float = 2.0
 
     # Cooldown
     cooldown_minutes: int = 45
@@ -164,6 +173,7 @@ class Config:
         assert 0 < self.max_risk_pct_per_trade <= 10
         assert self.account_balance > 0
         assert 0 < self.hurst_meanrev_max < self.hurst_trend_min < 1
+        assert self.counter_trend_lot_divisor >= 1.0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -816,7 +826,7 @@ class SignalGenerator:
         H = hurst_exponent(h1["close"])
         E = shannon_entropy(h1["close"])
 
-        # ADX override: trend M5 kuat mengalahkan Hurst H1 netral
+        # ADX override: strong M5 trend beats inconclusive H1 Hurst
         adx_override = adx_val >= self.cfg.adx_trend_override
         if adx_override or (H > self.cfg.hurst_trend_min and E < self.cfg.entropy_chaos_max):
             regime = "TREND"
@@ -879,7 +889,7 @@ class SignalGenerator:
             res.skip_reason = f"Hanya {active}/{self.cfg.parliament_min_active} model aktif"
             return res
 
-        # CHAOS: diagnostic vote tetap diisi, eksekusi diblok
+        # CHAOS: votes filled for diagnostics, execution blocked
         if regime == "CHAOS":
             res.skip_reason = f"Regime CHAOS (H={H:.2f} E={E:.2f})"
             return res
@@ -895,16 +905,36 @@ class SignalGenerator:
             res.skip_reason = f"Consensus {dom * 100:.0f}% < {self.cfg.parliament_min_ratio * 100:.0f}%"
             return res
 
+        def _counter_trend_allowed():
+            return (
+                self.cfg.allow_counter_trend
+                and adx_val >= self.cfg.counter_trend_min_adx
+                and dom >= self.cfg.counter_trend_min_consensus
+            )
+
         if res.buy_ratio > res.sell_ratio:
             if h1_t == "BEARISH" or h4_t == "BEARISH":
-                res.skip_reason = "BUY ditolak: HTF melawan"
-                return res
+                if _counter_trend_allowed():
+                    res.regime["counter_trend"] = True
+                else:
+                    res.skip_reason = f"BUY ditolak: HTF melawan (H1={h1_t} H4={h4_t})"
+                    res.regime["htf_h1"] = h1_t
+                    res.regime["htf_h4"] = h4_t
+                    return res
             res.direction = "BUY"
         else:
             if h1_t == "BULLISH" or h4_t == "BULLISH":
-                res.skip_reason = "SELL ditolak: HTF melawan"
-                return res
+                if _counter_trend_allowed():
+                    res.regime["counter_trend"] = True
+                else:
+                    res.skip_reason = f"SELL ditolak: HTF melawan (H1={h1_t} H4={h4_t})"
+                    res.regime["htf_h1"] = h1_t
+                    res.regime["htf_h4"] = h4_t
+                    return res
             res.direction = "SELL"
+
+        res.regime["htf_h1"] = h1_t
+        res.regime["htf_h4"] = h4_t
         return res
 
     def detect_order_block(self, df, side, lookback=40):
@@ -1285,16 +1315,20 @@ class RiskManagementEngine:
                 csl = ep if h1_ else sl
                 if side == "BUY":
                     if b["low"] <= csl:
-                        hb = True if h1_ else False
-                        hs = False if h1_ else True
+                        if h1_:
+                            hb = True
+                        else:
+                            hs = True
                         ch = True; continue
                     if not h1_ and b["high"] >= tp1: h1_ = True; ch = True
                     if not h2 and b["high"] >= tp2: h2 = True; ch = True
                     if not h3 and b["high"] >= tp3: h3 = True; ch = True
                 else:
                     if b["high"] >= csl:
-                        hb = True if h1_ else False
-                        hs = False if h1_ else True
+                        if h1_:
+                            hb = True
+                        else:
+                            hs = True
                         ch = True; continue
                     if not h1_ and b["low"] <= tp1: h1_ = True; ch = True
                     if not h2 and b["low"] <= tp2: h2 = True; ch = True
@@ -1531,6 +1565,11 @@ class TradingBotOrchestrator:
                 except Exception:
                     pass
 
+        entry = sl = tp1 = tp2 = tp3 = 0.0
+        lot = self.cfg.min_lot
+        note = ""
+        ob = None
+
         if should_fire:
             ob = self.signal.detect_order_block(m5c, pres.direction, lookback=40)
             try:
@@ -1553,6 +1592,21 @@ class TradingBotOrchestrator:
             elif pres.verdict == "EXECUTE_MICRO":
                 lot = max(self.cfg.min_lot, round(lot / 4.0, 2))
 
+            if pres.regime.get("counter_trend"):
+                lot = max(
+                    self.cfg.min_lot,
+                    round(lot / self.cfg.counter_trend_lot_divisor, 2),
+                )
+
+            ct_warning = ""
+            if pres.regime.get("counter_trend"):
+                ct_warning = (
+                    f"⚠️ <b>COUNTER-TREND</b> — H1={pres.regime.get('htf_h1')} "
+                    f"H4={pres.regime.get('htf_h4')}\n"
+                    f"<i>Lot sudah dikurangi {self.cfg.counter_trend_lot_divisor:.0f}×. "
+                    f"Konfirmasi manual sebelum eksekusi.</i>\n\n"
+                )
+
             msg = (
                 f"<b>🏛️ APEX v{VERSION} — {pres.direction} (LIMIT)</b>\n\n"
                 f"<b>{self.cfg.symbol}</b> limit @ <code>{entry:.3f}</code>\n"
@@ -1561,8 +1615,10 @@ class TradingBotOrchestrator:
                 f"Lot: <code>{lot}</code> ({pres.verdict}, {note})\n"
                 f"Voting: BUY={pres.buy_ratio * 100:.0f}% SELL={pres.sell_ratio * 100:.0f}%\n"
                 f"Regime: {pres.regime.get('regime', '?')} | ADX: {pres.adx:.1f}\n"
+                f"HTF: H1={pres.regime.get('htf_h1', '?')} H4={pres.regime.get('htf_h4', '?')}\n"
                 f"OB: "
                 f"{'✅ ' + str(round(ob['high'], 2)) + '–' + str(round(ob['low'], 2)) if ob else '⚠️ none'}\n\n"
+                f"{ct_warning}"
                 f"<i>Pasang limit order di MT5 pada harga di atas.</i>"
             )
             jid = f"{now_str.replace(' ', 'T')}_{pres.direction}_{lot}"
@@ -1573,6 +1629,7 @@ class TradingBotOrchestrator:
                 "lot": lot, "verdict": pres.verdict, "outcome": "PENDING",
                 "filled": 0, "r_achieved": 0.0,
                 "risk_pct": float(note.split("risk=")[1].rstrip("%")) if "risk=" in note else 2.0,
+                "counter_trend": bool(pres.regime.get("counter_trend")),
             }
             if self.risk.journal_append(entry_data):
                 self.tg.send(msg)
@@ -1606,6 +1663,8 @@ class TradingBotOrchestrator:
               f"Verdict: {pres.verdict}")
         print(f"ADX: {pres.adx:.1f} | Regime: {pres.regime.get('regime', '?')} | "
               f"ADX_override: {pres.regime.get('adx_override', False)}")
+        print(f"HTF: H1={pres.regime.get('htf_h1', '?')} | H4={pres.regime.get('htf_h4', '?')} | "
+              f"Counter-trend: {pres.regime.get('counter_trend', False)}")
         if pres.skip_reason:
             print(f"Skip: {pres.skip_reason}")
 
