@@ -1,147 +1,164 @@
-name: APEX Bot v17
+name: v17.0
 
+# ============================================================
+# TRIGGER
+# ============================================================
 on:
+  # Jadwal otomatis — tiap 5 menit (minimum GH Actions)
+  # Killzone sudah difilter di dalam kode (London/NY)
   schedule:
-    - cron: "2,17,32,47 6-21 * * 1-5"
+    - cron: '*/5 * * * *'
 
+  # Trigger manual dari tab Actions
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Run mode"
+      command:
+        description: 'Perintah yang dijalankan'
         required: true
-        default: "run"
+        default: 'smoke'
         type: choice
         options:
           - run
           - smoke
           - selftest
           - test-tg
-      live_override:
-        description: "Force LIVE (bypass DRY_RUN untuk run ini saja)"
-        required: false
-        default: false
-        type: boolean
 
-concurrency:
-  group: apex-bot-v17
-  cancel-in-progress: false
+  # Trigger saat kode di-push
+  push:
+    branches: [main, master]
+    paths:
+      - 'apex_v17.py'
+      - '.github/workflows/apex.yml'
 
+# ============================================================
+# PERMISSIONS & CONCURRENCY
+# ============================================================
 permissions:
   contents: read
 
+# Pastikan tidak ada 2 run barengan (menghindari race condition di Gist)
+concurrency:
+  group: apex-predator
+  cancel-in-progress: false
+
+# ============================================================
+# JOBS
+# ============================================================
 jobs:
-  run:
+  apex:
+    name: APEX v17 Run
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      TZ: UTC
+    timeout-minutes: 8
 
-      # ── Secrets (Atur di GitHub Repo Settings -> Secrets) ──
-      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}[cite: 2]
-      TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}[cite: 2]
-      TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}[cite: 2]
-      GIST_ID:             ${{ secrets.GIST_ID }}[cite: 2]
-      GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}[cite: 2]
-      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # Opsional[cite: 2]
-
-      # ── Kill switch & mode (Atur di GitHub Repo Variables) ─
-      APEX_KILL:    ${{ vars.APEX_KILL || 'false' }}[cite: 2]
-      APEX_DRY_RUN: ${{ github.event.inputs.live_override == 'true' && 'false' || (vars.APEX_DRY_RUN || 'true') }}[cite: 2]
-
-      # ── Akun & Risk ────────────────────────────────────────
-      APEX_ACCOUNT_BALANCE:            "1000"[cite: 2]
-      APEX_MAX_RISK_PCT_PER_TRADE:     "2.0"[cite: 2]
-      APEX_HARD_LEVERAGE_CAP:          "50"[cite: 2]
-      APEX_MAX_DAILY_LOSS_PCT:         "4.0"[cite: 2]
-      APEX_MAX_CONSECUTIVE_LOSSES:     "3"[cite: 2]
-      APEX_MAX_DAILY_SIGNALS:          "5"[cite: 2]
-      APEX_DD_PAUSE_HOURS:             "24"[cite: 2]
-
-      # ── Data ───────────────────────────────────────────────
-      APEX_M5_FETCH_SIZE:              "800"[cite: 2]
-      APEX_MIN_BARS_M5:                "100"[cite: 2]
-      APEX_MIN_BARS_H1:                "100"[cite: 2]
-      APEX_MIN_BARS_H4:                "50"[cite: 2]
-      APEX_MAX_STALE_MULT:             "3.0"[cite: 2]
-      APEX_MT5_OFFSET:                 "0.0"[cite: 2]
-
-      # ── Parliament ─────────────────────────────────────────
-      APEX_ADX_MIN:                    "22.0"[cite: 2]
-      APEX_PARLIAMENT_MIN_ACTIVE:      "8"[cite: 2]
-      APEX_PARLIAMENT_MIN_RATIO:       "0.55"[cite: 2]
-      APEX_PARLIAMENT_HALF_RATIO:      "0.65"[cite: 2]
-      APEX_PARLIAMENT_FULL_RATIO:      "0.75"[cite: 2]
-
-      # ── ML Settings (v17) ──────────────────────────────────
-      APEX_ML_USE_TRIPLE_BARRIER:      "true"[cite: 2]
-      APEX_ML_PURGE_BARS:              "10"[cite: 2]
-      APEX_ML_MIN_VAL_ACC:             "0.54"
-
-      # ── News blackout ──────────────────────────────────────
-      APEX_NEWS_BLACKOUT_MIN:          "30"[cite: 2]
-      APEX_NEWS_CACHE_SEC:             "1800"[cite: 2]
+    # Skip untuk push event (hanya jalankan smoke test)
+    if: github.event_name != 'push'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4[cite: 2]
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 1[cite: 2]
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
-      - name: Setup Python
-        uses: actions/setup-python@v5[cite: 2]
+      - name: 📦 Cache pip packages
+        uses: actions/cache@v4
         with:
-          python-version: "3.11"[cite: 2]
-          cache: pip[cite: 2]
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt[cite: 2]
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            numpy \
+            pandas \
+            requests \
+            scikit-learn \
+            scipy
 
-      - name: Selftest (fail-fast)
-        run: python apex_v17.py selftest[cite: 2]
+      - name: 🧪 Selftest (wajib lulus)
+        env:
+          APEX_DRY_RUN: 'false'
+        run: python apex_v17.py selftest
 
-      - name: Telegram connectivity
-        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'test-tg' || github.event.inputs.mode == 'run'
-        run: python apex_v17.py test-tg[cite: 2]
+      - name: 🚀 Execute command
+        env:
+          # ---- Kredensial (set di repo Settings > Secrets) ----
+          GIST_ID:                ${{ secrets.GIST_ID }}
+          GIST_TOKEN:             ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:          ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:    ${{ secrets.TWELVE_DATA_API_KEY }}
 
-      - name: Smoke test (parliament dry analysis)
-        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'run'
-        run: python apex_v17.py smoke[cite: 2]
+          # ---- Konfigurasi APEX (dapat dioverride) ----
+          APEX_DRY_RUN:           'false'
+          APEX_SYMBOL:            'XAUUSD'
+          APEX_ACCOUNT_BALANCE:   '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE: '2.0'
+          APEX_MAX_DAILY_LOSS_PCT: '4.0'
+          APEX_MAX_CONSECUTIVE_LOSSES: '3'
+          APEX_MAX_DAILY_SIGNALS: '5'
+          APEX_MT5_OFFSET:        '0.0'
+        run: |
+          # Tentukan command dari input manual atau default 'run' untuk schedule
+          CMD="${{ github.event.inputs.command || 'run' }}"
+          echo "▶️ Running: python apex_v17.py $CMD"
+          python apex_v17.py "$CMD"
 
-      - name: Production run
-        if: github.event.inputs.mode == '' || github.event.inputs.mode == 'run'
-        run: python apex_v17.py run[cite: 2]
+      - name: 📋 Upload local state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-state-${{ github.run_number }}
+          path: apex_state_v17.json
+          retention-days: 7
+          if-no-files-found: ignore
 
-      - name: Journal snapshot
+      - name: 🧾 Log summary
         if: always()
         run: |
-          python - <<'PYEOF' || true
-          import os, json, requests
-          gid = os.getenv("GIST_ID", "").strip()
-          tok = os.getenv("GIST_TOKEN", "").strip()
-          if not gid or not tok:
-              print("No Gist configured - local only")
-              raise SystemExit(0)
-          try:
-              r = requests.get(
-                  f"https://api.github.com/gists/{gid}",
-                  headers={"Authorization": f"Bearer {tok}"},
-                  timeout=10,
-              )
-              files = r.json().get("files", {})
-              if "apex_state_v17.json" not in files:
-                  print("No state file in Gist")
-                  raise SystemExit(0)
-              st = json.loads(files["apex_state_v17.json"]["content"])
-              j = st.get("journal", [])
-              print(f"=== JOURNAL ({len(j)} entries) ===")
-              for e in j[:10]:
-                  print(
-                      f"  {e.get('timestamp','?'):19s} {e.get('signal','?'):4s} "
-                      f"{e.get('outcome','?'):12s} "
-                      f"filled={e.get('filled','?')} "
-                      f"R={float(e.get('r_achieved',0) or 0):+.2f} "
-                      f"lot={e.get('lot','?')}"
-                  )
-          except Exception as ex:
-              print(f"Snapshot error: {ex}")
-          PYEOF
+          echo "### APEX v17.0 Run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Event**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Command**: \`${{ github.event.inputs.command || 'run' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+# ============================================================
+# PUSH VALIDATION JOB (hanya smoke test, tidak kirim sinyal)
+# ============================================================
+  validate-on-push:
+    name: Validation on Push (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir numpy pandas requests scikit-learn scipy
+
+      - name: 🧪 Selftest
+        run: python apex_v17.py selftest
+
+      - name: 💨 Smoke test
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}
+          APEX_DRY_RUN:        'true'
+        run: python apex_v17.py smoke
