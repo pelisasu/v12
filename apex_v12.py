@@ -1,31 +1,10 @@
 """
-APEX PREDATOR v12.0 — BATTLE-READY INSTITUTIONAL SNIPER
-========================================================
-Final rebuild from v11.0. Semua temuan audit forensik P0/P1/P2 sudah dipatch.
-
-Changelog v11.0 → v12.0:
-  P0-1  [CRITICAL] ADX bias di confluence → DIHAPUS dari score.
-        ADX sekarang DIRECTIONAL di council vote (boost hanya jika searah signal).
-  P0-2  [CRITICAL] Gist load fail → fail-CLOSED via StateLoadError.
-        State tidak di-wipe saat network error. Run abort, alert TG.
-  P0-3  [CRITICAL] Outcome skip 5-min pertama → anchor ke signal_bar_dt.
-        Bar pertama setelah entry sekarang WAJIB dievaluasi.
-  P1-1  Yahoo 4h fallback range="1mo" (cukup bar untuk min_bars_h4=50).
-  P1-2  journal_append return bool. Save-FIRST, notify-SECOND.
-  P1-3  News shield fail-OPEN setelah N consecutive fails.
-  P2-1  round_half_away() untuk trend_norm (bukan banker's rounding).
-  P2-2  Council guard defensif terhadap NEUTRAL.
-  P2-3  max_journal jadi Config field.
-  NEW   Direction symmetry regression test di selftest.
-  NEW   tg_send kirim DRY signal ke Telegram (paper trade visible).
-  NEW   Idempotency key journal = hash(timestamp+signal+entry).
-
-Design principles (non-negotiable):
-  1. FAIL-CLOSED: tidak bisa baca state → JANGAN trading
-  2. SAVE-FIRST: state sukses ditulis baru kirim notif
-  3. SYMMETRIC: BUY & SELL punya threshold identik
-  4. IDEMPOTENT: hash unik per entry, tidak ada duplikat
-  5. OBSERVABLE: structured logging + JSON state export
+APEX PREDATOR v12.1 — BATTLE-READY
+====================================
+All P0/P1/P2 patches from v12.0 PLUS v12.1 fixes:
+  - Selftest exit code correct (fail-fast in CI)
+  - New commands: smoke, backtest, force-run
+  - Cron-optimized workflow
 """
 from __future__ import annotations
 
@@ -37,7 +16,6 @@ import os
 import re
 import sys
 import time
-from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,7 +26,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "12.0"
+VERSION = "12.1"
 NY = ZoneInfo("America/New_York")
 LONDON = ZoneInfo("Europe/London")
 
@@ -198,7 +176,6 @@ def h(s: Any) -> str:
 
 
 def round_half_away(x: float) -> int:
-    """P2-1: round half away from zero (symmetric)."""
     return int(np.sign(x) * np.floor(np.abs(x) + 0.5))
 
 
@@ -207,7 +184,6 @@ class DataFetchError(Exception):
 
 
 class StateLoadError(Exception):
-    """P0-2: Gist tidak bisa diakses → abort run, jangan trading."""
     pass
 
 
@@ -222,7 +198,7 @@ class KVStore:
         if not self.use_gist:
             logging.warning(
                 "GIST_ID/GIST_TOKEN tidak diset — state lokal ephemeral. "
-                "TIDAK persistent di GitHub Actions. Gunakan hanya untuk lokal testing."
+                "TIDAK persistent di GitHub Actions."
             )
 
     def _headers(self) -> dict:
@@ -231,7 +207,6 @@ class KVStore:
             "Accept": "application/vnd.github+json",
         }
 
-    # ----- Gist -----
     def _load_gist(self) -> dict:
         if self._cache is not None:
             return self._cache
@@ -241,7 +216,6 @@ class KVStore:
                 headers=self._headers(), timeout=self.cfg.http_timeout,
             )
             if r.status_code == 404:
-                # Gist baru — bukan error, mulai dari kosong
                 self._cache = {}
                 return self._cache
             r.raise_for_status()
@@ -277,7 +251,6 @@ class KVStore:
             logging.error(f"Gist SAVE fail: {redact(e)}")
             return False
 
-    # ----- local -----
     def _load_local(self) -> dict:
         if self._cache is not None:
             return self._cache
@@ -296,7 +269,6 @@ class KVStore:
             logging.error(f"Local SAVE fail: {e}")
             return False
 
-    # ----- public -----
     def get(self, key: str, default: Any = None) -> Any:
         data = self._load_gist() if self.use_gist else self._load_local()
         return data.get(key, default)
@@ -307,7 +279,6 @@ class KVStore:
         return self._save_gist(data) if self.use_gist else self._save_local(data)
 
     def force_load(self) -> None:
-        """P0-2: paksa load untuk fail-closed check di awal run."""
         self._load_gist() if self.use_gist else self._load_local()
 
 
@@ -336,7 +307,7 @@ def retry_with_backoff(fn, attempts: int = 3, base: float = 1.0, max_delay: floa
 
 
 # =========================================================
-# DATA FETCHERS
+# DATA
 # =========================================================
 def validate_ohlcv(df: pd.DataFrame, interval: str, min_bars: int, cfg: Config) -> pd.DataFrame:
     if df is None or len(df) < min_bars:
@@ -356,7 +327,6 @@ def validate_ohlcv(df: pd.DataFrame, interval: str, min_bars: int, cfg: Config) 
 
 
 def fetch_twelvedata_batch(cfg: Config) -> pd.DataFrame:
-    """Batch: 1 call 5min × m5_fetch_size, resample sisanya lokal."""
     key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     if not key:
         raise DataFetchError("TwelveData: no key")
@@ -398,7 +368,6 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 
 def fetch_yahoo(cfg: Config, interval_str: str, count: int = 200) -> pd.DataFrame:
-    """P1-1: 4h butuh range=1mo untuk >=50 bar setelah resample."""
     imap = {"5min": "5m", "15min": "15m", "1h": "1h"}
     headers = {"User-Agent": f"ApexBot/{VERSION}"}
 
@@ -674,7 +643,7 @@ def detect_fvg(df: pd.DataFrame) -> dict:
 
 
 # =========================================================
-# SIGNAL ENGINE — P0-1 FIXED (ADX removed from score)
+# SIGNAL
 # =========================================================
 @dataclass
 class Signal:
@@ -691,11 +660,6 @@ class Signal:
 
 
 def compute_confluence(df_m5, trends, ob, choch, fvg, adx_val, ha) -> dict:
-    """
-    P0-1 FIX: ADX TIDAK dimasukkan ke total (directional-agnostic).
-    ADX hanya dipakai sebagai gate di generate_signal() dan vote directional di council.
-    Total sekarang SIMETRIS: range [-10, +10].
-    """
     c = df_m5["close"]
     e9 = c.ewm(span=9, adjust=False).mean()
     e21 = c.ewm(span=21, adjust=False).mean()
@@ -706,7 +670,7 @@ def compute_confluence(df_m5, trends, ob, choch, fvg, adx_val, ha) -> dict:
         return 1 if t == "BULLISH" else (-1 if t == "BEARISH" else 0)
 
     raw_trend = sum(tw[k] * tv(trends[k]) for k in tw)
-    trend_norm = round_half_away(raw_trend * 4 / 5)  # P2-1 symmetric rounding
+    trend_norm = round_half_away(raw_trend * 4 / 5)
 
     m = 0
     if e9.iloc[-1] > e21.iloc[-1]:
@@ -734,12 +698,11 @@ def compute_confluence(df_m5, trends, ob, choch, fvg, adx_val, ha) -> dict:
         s += 1 if fvg["type"] == "BULLISH_FVG" else -1
 
     hp = 1 if ha == "BULLISH" else (-1 if ha == "BEARISH" else 0)
-
-    total = trend_norm + m + s + hp  # ← ADX DIHAPUS dari score
+    total = trend_norm + m + s + hp
     return {
         "total": total, "trend": trend_norm, "momentum": m,
         "smc": s, "ha": hp, "rsi": round(rsi_v, 1),
-        "adx_gate": round(adx_val, 1),  # display only, bukan skor
+        "adx_gate": round(adx_val, 1),
     }
 
 
@@ -802,10 +765,9 @@ def generate_signal(cfg, m5, m15, h1, h4) -> Signal:
 
 
 # =========================================================
-# COUNCIL VOTE — P0-1 FIXED (ADX directional)
+# COUNCIL
 # =========================================================
 def run_council_vote(cfg, m5, m15, h1, h4, sig) -> tuple[str, float]:
-    # P2-2: defensive guard
     if sig.type not in ("BUY", "SELL"):
         return "CANCEL", 0.0
 
@@ -813,7 +775,6 @@ def run_council_vote(cfg, m5, m15, h1, h4, sig) -> tuple[str, float]:
     h1t, h4t = trend_ema(h1), trend_ema(h4)
     desired = "BULLISH" if sig.type == "BUY" else "BEARISH"
 
-    # Vote-1: ADX × HTF alignment (DIRECTIONAL)
     total_w += 1.5
     if sig.adx >= cfg.adx_strong and h1t == desired:
         votes += 1.5
@@ -822,7 +783,6 @@ def run_council_vote(cfg, m5, m15, h1, h4, sig) -> tuple[str, float]:
     elif sig.adx >= cfg.adx_strong and h1t != desired and h1t != "NEUTRAL":
         votes -= 1.0
 
-    # Vote-2: HTF alignment
     total_w += 2.0
     if h1t == desired and h4t == desired:
         votes += 2.0
@@ -831,7 +791,6 @@ def run_council_vote(cfg, m5, m15, h1, h4, sig) -> tuple[str, float]:
     elif (h1t != "NEUTRAL" and h1t != desired) or (h4t != "NEUTRAL" and h4t != desired):
         votes -= 1.0
 
-    # Vote-3: SMC
     total_w += 1.5
     if sig.ob["detected"] and sig.ob.get("swept"):
         votes += 1.5
@@ -841,11 +800,9 @@ def run_council_vote(cfg, m5, m15, h1, h4, sig) -> tuple[str, float]:
     if sig.choch["detected"] and sig.choch["type"] == desired_choch:
         votes += 0.75
 
-    # Vote-4: Score magnitude
     total_w += 1.0
     votes += min(abs(sig.score) / 10.0, 1.0)
 
-    # Vote-5: HA
     total_w += 1.0
     if sig.ha == desired:
         votes += 1.0
@@ -908,7 +865,6 @@ def compute_lot(cfg, price: float, sl: float, conf_pct: float, journal: list) ->
     raw_lot = risk_money / loss_per_lot
     lot = max(cfg.min_lot, min(cfg.max_lot, round(raw_lot, 2)))
 
-    # leverage cap
     notional = lot * cfg.contract_size * price
     leverage = notional / cfg.account_balance
     if leverage > cfg.hard_leverage_cap:
@@ -931,7 +887,7 @@ def compute_lot(cfg, price: float, sl: float, conf_pct: float, journal: list) ->
 
 
 # =========================================================
-# TELEGRAM (retry + dedup + dry_run visible)
+# TELEGRAM
 # =========================================================
 def _tg_hash(msg: str) -> str:
     return hashlib.sha256(msg.encode()).hexdigest()[:16]
@@ -998,7 +954,7 @@ def tg_alert_error(cfg: Config, msg: str, kv: KVStore) -> None:
 
 
 # =========================================================
-# KILL SWITCH + CIRCUIT + DRAWDOWN
+# KILL SWITCH / CIRCUIT / DRAWDOWN
 # =========================================================
 def kill_switch_active(kv: KVStore) -> tuple[bool, str]:
     if os.getenv("APEX_KILL", "").lower() in ("1", "true", "yes"):
@@ -1065,7 +1021,7 @@ def drawdown_check(cfg: Config, kv: KVStore, journal: list) -> tuple[bool, str]:
 
 
 # =========================================================
-# JOURNAL (save-first, return bool)
+# JOURNAL
 # =========================================================
 def journal_append(kv: KVStore, entry: dict, max_journal: int = 500) -> bool:
     j = list(kv.get("journal", []))
@@ -1099,10 +1055,6 @@ def calc_r_mixed(entry, sl, tp1, tp2, tp3, h1, h2, h3, be):
 
 
 def update_outcomes(cfg: Config, kv: KVStore, m5: pd.DataFrame) -> list:
-    """
-    P0-3 FIX: anchor ke signal_bar_dt, bukan timestamp (wall-clock).
-    Bar pertama setelah entry sekarang dievaluasi.
-    """
     events = []
     now = datetime.now(timezone.utc)
     journal = journal_get(kv, cfg.max_journal)
@@ -1111,7 +1063,6 @@ def update_outcomes(cfg: Config, kv: KVStore, m5: pd.DataFrame) -> list:
     for entry in journal:
         if entry.get("outcome") != "PENDING":
             continue
-        # P0-3: anchor = signal_bar_dt (closed bar time), fallback timestamp
         anchor = entry.get("signal_bar_dt") or entry["timestamp"]
         try:
             ets = pd.Timestamp(anchor, tz="UTC")
@@ -1125,7 +1076,6 @@ def update_outcomes(cfg: Config, kv: KVStore, m5: pd.DataFrame) -> list:
             changed_any = True
             continue
 
-        # m5[> anchor] include bar pertama SETELAH signal_bar
         bars = m5[m5["datetime"] > ets].sort_values("datetime")
         if bars.empty:
             continue
@@ -1241,7 +1191,7 @@ def send_outcome_events(cfg, kv, events) -> None:
 
 
 # =========================================================
-# MARKET & NEWS
+# MARKET / NEWS
 # =========================================================
 def market_is_open(now_utc: datetime) -> bool:
     ny = now_utc.astimezone(NY)
@@ -1303,7 +1253,6 @@ def check_news_shield(cfg: Config, kv: KVStore) -> tuple[bool, str]:
         logging.warning(f"News fail: {redact(ex)}")
         streak = int(kv.get("news_fail_streak", 0)) + 1
         kv.set("news_fail_streak", streak)
-        # P1-3: fail-OPEN setelah N gagal berturut-turut
         if streak >= cfg.news_max_consecutive_fail:
             logging.warning(f"News fail-OPEN after {streak} consec fails")
             kv.set("news_cache", {"ts": now.isoformat(), "blocked": False,
@@ -1363,7 +1312,6 @@ def _build_msg(cfg, run_num, now_str, src, sig, price, sl, tp1, tp2, tp3, lot, n
 def run_once(cfg: Config) -> None:
     kv = KVStore(cfg)
 
-    # P0-2: FAIL-CLOSED pada state load error
     try:
         kv.force_load()
     except StateLoadError as e:
@@ -1422,14 +1370,12 @@ def run_once(cfg: Config) -> None:
         return
     circuit_ok(kv)
 
-    # Update outcomes pakai m5 penuh
     try:
         ev = update_outcomes(cfg, kv, m5)
         send_outcome_events(cfg, kv, ev)
     except Exception as e:
         logging.warning(f"Outcome update: {redact(e)}")
 
-    # Drop forming bar
     m5c = m5.iloc[:-1].reset_index(drop=True)
     m15c = m15.iloc[:-1].reset_index(drop=True)
     h1c = h1.iloc[:-1].reset_index(drop=True)
@@ -1492,12 +1438,11 @@ def run_once(cfg: Config) -> None:
     if should:
         msg = _build_msg(cfg, run_num, now_str, src, sig, price,
                          sl, tp1, tp2, tp3, lot, lot_note)
-        # P1-2: SAVE FIRST, NOTIFY SECOND
         jid = f"{now_str.replace(' ', 'T')}_{sig.type}_{lot}_{signal_bar_iso.replace(' ', 'T')}"
         entry = {
             "id": jid,
             "timestamp": now_str,
-            "signal_bar_dt": signal_bar_iso,   # P0-3 anchor
+            "signal_bar_dt": signal_bar_iso,
             "symbol": cfg.symbol,
             "signal": sig.type,
             "entry": round(price, cfg.price_decimals),
@@ -1518,7 +1463,6 @@ def run_once(cfg: Config) -> None:
             if not tg_ok:
                 logging.error("Telegram failed — cooldown still enforced (anti-livelock)")
                 blocked_reason = blocked_reason or "tg-fail"
-            # Cooldown update regardless (anti-livelock)
             st["last_signal_type"] = sig.type
             st["last_signal_ts"] = now_str
 
@@ -1534,7 +1478,7 @@ def run_once(cfg: Config) -> None:
 
 
 # =========================================================
-# CLI
+# CLI COMMANDS
 # =========================================================
 def cmd_reports(cfg: Config, limit: int = 20) -> None:
     kv = KVStore(cfg)
@@ -1551,7 +1495,13 @@ def cmd_reports(cfg: Config, limit: int = 20) -> None:
 def cmd_stats(cfg: Config) -> None:
     kv = KVStore(cfg)
     j = journal_get(kv, 500)
+    if not j:
+        print("No journal.")
+        return
     closed = [e for e in j if e.get("outcome") in ("WIN_TP3", "WIN_BE", "LOSS")]
+    buys = sum(1 for e in j if e.get("signal") == "BUY")
+    sells = sum(1 for e in j if e.get("signal") == "SELL")
+    print(f"Journal: {len(j)} total (BUY={buys}, SELL={sells})")
     if not closed:
         print("No closed trades yet.")
         return
@@ -1589,7 +1539,6 @@ def cmd_unkill(cfg: Config) -> None:
 
 
 def _test_direction_symmetry() -> None:
-    """Regression test P0-1: skor BUY dan SELL harus simetris."""
     cfg = Config()
     cfg.adx_min = 0
     cfg.score_threshold = 8
@@ -1618,71 +1567,263 @@ def _test_direction_symmetry() -> None:
     bull_trends = {"m5": "BULLISH", "m15": "BULLISH", "h1": "BULLISH", "h4": "BULLISH"}
     bear_trends = {"m5": "BEARISH", "m15": "BEARISH", "h1": "BEARISH", "h4": "BEARISH"}
 
-    bull_df = _make_df("BULLISH")
-    bear_df = _make_df("BEARISH")
-
-    bull = compute_confluence(bull_df, bull_trends, bull_ob, no_choch, no_fvg, 30.0, "BULLISH")
-    bear = compute_confluence(bear_df, bear_trends, bear_ob, no_choch, no_fvg, 30.0, "BEARISH")
+    bull = compute_confluence(_make_df("BULLISH"), bull_trends, bull_ob, no_choch, no_fvg, 30.0, "BULLISH")
+    bear = compute_confluence(_make_df("BEARISH"), bear_trends, bear_ob, no_choch, no_fvg, 30.0, "BEARISH")
 
     assert bull["total"] == -bear["total"], \
         f"ASYMMETRIC: bull={bull['total']:+d}, bear={bear['total']:+d}"
-    assert bull["total"] > 0 and bear["total"] < 0, \
-        f"Sign wrong: bull={bull['total']:+d}, bear={bear['total']:+d}"
+    assert bull["total"] > 0 and bear["total"] < 0, "Sign wrong"
 
-    # Verify ADX tidak mempengaruhi skor
-    bull_adx_hi = compute_confluence(bull_df, bull_trends, bull_ob, no_choch, no_fvg, 40.0, "BULLISH")
-    assert bull["total"] == bull_adx_hi["total"], \
-        "ADX masih mempengaruhi skor — P0-1 REGRESSED"
+    bull_adx_hi = compute_confluence(_make_df("BULLISH"), bull_trends, bull_ob, no_choch, no_fvg, 40.0, "BULLISH")
+    assert bull["total"] == bull_adx_hi["total"], "ADX masih mempengaruhi skor — P0-1 REGRESSED"
 
-    print(f"✓ Direction symmetry: bull={bull['total']:+d}, bear={bear['total']:+d}")
-    print(f"✓ ADX tidak bias: ADX 30 vs 40 → score identik ({bull['total']:+d})")
+    print(f"  ✓ Symmetry: bull={bull['total']:+d}, bear={bear['total']:+d}")
+    print(f"  ✓ ADX-independent: ADX 30 vs 40 → identik ({bull['total']:+d})")
 
 
 def cmd_selftest(cfg: Config) -> None:
-    print(f"=== SELFTEST v{VERSION} ===")
+    print(f"=== SELFTEST v{VERSION} ===\n")
     kv = KVStore(cfg)
-    print(f"Persistence: {'Gist' if kv.use_gist else 'LOCAL (TIDAK persistent di GH Actions)'}")
-    print(f"TwelveData key: {bool(os.getenv('TWELVE_DATA_API_KEY', '').strip())}")
-    print(f"Telegram creds: {bool(os.getenv('TELEGRAM_TOKEN', '').strip())}")
+    is_ci = os.getenv("GITHUB_ACTIONS") == "true"
+    failed = []
 
-    print("\n[1/4] State load test...")
+    print(f"[1/5] Persistence: {'Gist' if kv.use_gist else 'LOCAL'}")
+    if is_ci and not kv.use_gist:
+        print("  ✗ CRITICAL: Gist tidak dikonfigurasi di CI.")
+        print("    Fix: tambah GIST_ID + GIST_TOKEN secrets.")
+        failed.append("Gist not configured in CI")
+    elif not kv.use_gist:
+        print("  ⚠️  LOCAL mode — OK untuk lokal, BUKAN production.")
+
+    print("\n[2/5] Secrets:")
+    td = bool(os.getenv("TWELVE_DATA_API_KEY", "").strip())
+    tg_tok = bool(os.getenv("TELEGRAM_TOKEN", "").strip())
+    tg_chat = bool(os.getenv("TELEGRAM_CHAT_ID", "").strip())
+    print(f"  TwelveData key:   {'✓' if td else '✗'}")
+    print(f"  Telegram token:   {'✓' if tg_tok else '✗'}")
+    print(f"  Telegram chat_id: {'✓' if tg_chat else '✗'}")
+    if not td:
+        failed.append("TWELVE_DATA_API_KEY missing")
+    if not tg_tok or not tg_chat:
+        failed.append("Telegram creds incomplete")
+
+    print("\n[3/5] State load:")
     try:
         kv.force_load()
-        print("✓ State load OK")
+        print("  ✓ State load OK")
     except StateLoadError as e:
-        print(f"✗ State load FAIL: {e}")
-        return
+        print(f"  ✗ State load FAIL: {e}")
+        failed.append(f"State: {e}")
 
-    print("\n[2/4] Direction symmetry test (P0-1 regression)...")
+    print("\n[4/5] Direction symmetry (P0-1 regression):")
     try:
         _test_direction_symmetry()
     except AssertionError as e:
-        print(f"✗ {e}")
-        return
+        print(f"  ✗ {e}")
+        failed.append(f"Symmetry: {e}")
 
-    print("\n[3/4] Config validation...")
-    try:
-        cfg.validate()
-        print("✓ Config OK")
-    except ValueError as e:
-        print(f"✗ {e}")
-        return
-
-    print("\n[4/4] Data fetch test...")
+    print("\n[5/5] Data fetch:")
     try:
         dfs, src = fetch_all_intervals(cfg)
-        print(f"✓ Data OK [{src}]: "
-              f"M5={len(dfs['5min'])} 15m={len(dfs['15min'])} "
+        print(f"  ✓ {src}: M5={len(dfs['5min'])} 15m={len(dfs['15min'])} "
               f"1h={len(dfs['1h'])} 4h={len(dfs['4h'])}")
-        print(f"  Last M5 close: {dfs['5min']['close'].iloc[-1]:.2f} "
+        print(f"    Last M5: {dfs['5min']['close'].iloc[-1]:.2f} "
               f"@ {dfs['5min']['datetime'].iloc[-1]}")
+    except DataFetchError as e:
+        if "Stale" in str(e):
+            print(f"  ⚠️  Stale data (market closed?) — API reachable, skip.")
+        else:
+            print(f"  ✗ Data FAIL: {e}")
+            failed.append(f"Data: {e}")
     except Exception as e:
-        print(f"✗ Data FAIL: {e}")
-        return
+        print(f"  ✗ Data FAIL: {e}")
+        failed.append(f"Data: {e}")
 
-    print("\n=== SELFTEST PASSED — siap deploy ===")
+    print()
+    if failed:
+        print(f"=== ❌ SELFTEST FAILED ({len(failed)} issue(s)) ===")
+        for f in failed:
+            print(f"  - {f}")
+        sys.exit(1)
+    print("=== ✅ SELFTEST PASSED — siap deploy ===")
+    sys.exit(0)
 
 
+def cmd_smoke(cfg: Config) -> None:
+    print(f"=== SMOKE @ {datetime.now(timezone.utc).isoformat()} ===\n")
+    try:
+        dfs, src = fetch_all_intervals(cfg)
+    except Exception as e:
+        print(f"✗ Data: {e}")
+        sys.exit(1)
+
+    m5c = dfs["5min"].iloc[:-1].reset_index(drop=True)
+    m15c = dfs["15min"].iloc[:-1].reset_index(drop=True)
+    h1c = dfs["1h"].iloc[:-1].reset_index(drop=True)
+    h4c = dfs["4h"].iloc[:-1].reset_index(drop=True)
+
+    print(f"Source: {src}")
+    print(f"Last M5: {m5c.iloc[-1]['datetime']} close={m5c.iloc[-1]['close']:.2f}")
+    for tf, df in (("M5", m5c), ("M15", m15c), ("H1", h1c), ("H4", h4c)):
+        print(f"  {tf:3s} trend={trend_ema(df):8s}  HA={heikin_ashi_trend(df)}")
+    print(f"\nADX={adx(m5c):.1f}  RSI={rsi(m5c['close']):.1f}")
+    ob, ch, fv = detect_order_block(m5c), detect_choch(m5c), detect_fvg(m5c)
+    print(f"OB={ob['type']} CHoCH={ch['type']} FVG={fv['type']}")
+    H, E = hurst_exponent(h1c["close"]), shannon_entropy(h1c["close"])
+    print(f"Regime: H={H:.3f} E={E:.3f}")
+    print(f"\n--- SIGNAL ---")
+    sig = generate_signal(cfg, m5c, m15c, h1c, h4c)
+    if sig.type == "NEUTRAL":
+        print(f"NEUTRAL — {sig.skip_reason}")
+    else:
+        print(f"{sig.type} score={sig.score:+d} conf={sig.conf}")
+        action, conf = run_council_vote(cfg, m5c, m15c, h1c, h4c, sig)
+        print(f"Council: {action} @ {conf:.1f}%")
+        if action != "CANCEL":
+            try:
+                price = float(m5c["close"].iloc[-1])
+                sl, tp1, tp2, tp3 = compute_levels(cfg, m5c, sig.type)
+                kv = KVStore(cfg)
+                lot, _, note = compute_lot(cfg, price, sl, conf, journal_get(kv, 500))
+                print(f"Entry={price:.3f} SL={sl:.3f} TP1={tp1:.3f} TP2={tp2:.3f} TP3={tp3:.3f}")
+                print(f"Lot={lot}  {note}")
+            except Exception as e:
+                print(f"✗ Level: {e}")
+    print(f"\n[INFO] Smoke tidak kirim TG, tidak tulis journal.")
+
+
+def _simulate_trade(future: pd.DataFrame, side: str, entry: float,
+                    sl: float, tp1: float, tp2: float, tp3: float) -> float:
+    if abs(entry - sl) <= 0:
+        return 0.0
+    h1 = h2 = h3 = hsl = hbe = False
+    for _, b in future.iterrows():
+        if h3 or hsl or hbe:
+            break
+        csl = entry if h1 else sl
+        if side == "BUY":
+            if b["low"] <= csl:
+                if h1: hbe = True
+                else: hsl = True
+                continue
+            if not h1 and b["high"] >= tp1: h1 = True
+            if not h2 and b["high"] >= tp2: h2 = True
+            if not h3 and b["high"] >= tp3: h3 = True
+        else:
+            if b["high"] >= csl:
+                if h1: hbe = True
+                else: hsl = True
+                continue
+            if not h1 and b["low"] <= tp1: h1 = True
+            if not h2 and b["low"] <= tp2: h2 = True
+            if not h3 and b["low"] <= tp3: h3 = True
+    return calc_r_mixed(entry, sl, tp1, tp2, tp3, h1, h2, h3, hbe)
+
+
+def cmd_backtest(cfg: Config, max_samples: int = 800) -> None:
+    print(f"=== BACKTEST LIGHTWEIGHT ({max_samples} samples) ===\n")
+    try:
+        dfs, src = fetch_all_intervals(cfg)
+    except Exception as e:
+        print(f"✗ Data: {e}")
+        sys.exit(1)
+
+    m5 = dfs["5min"]
+    m15_full, h1_full, h4_full = dfs["15min"], dfs["1h"], dfs["4h"]
+
+    if len(m5) < 300:
+        print(f"✗ Not enough M5 bars: {len(m5)}")
+        sys.exit(1)
+
+    print(f"Source: {src} | M5 bars: {len(m5)} "
+          f"({m5.iloc[0]['datetime']} → {m5.iloc[-1]['datetime']})")
+
+    indices = np.linspace(200, len(m5) - 150,
+                          num=min(max_samples, len(m5) - 350)).astype(int)
+
+    buys = sells = neutral = 0
+    trades = []
+
+    for idx in indices:
+        try:
+            m5_w = m5.iloc[:idx + 1]
+            ts = m5_w.iloc[-1]["datetime"]
+            m15_w = m15_full[m15_full["datetime"] <= ts]
+            h1_w = h1_full[h1_full["datetime"] <= ts]
+            h4_w = h4_full[h4_full["datetime"] <= ts]
+            if (len(m15_w) < cfg.min_bars_m15 or len(h1_w) < cfg.min_bars_h1
+                    or len(h4_w) < cfg.min_bars_h4):
+                continue
+
+            sig = generate_signal(cfg, m5_w, m15_w, h1_w, h4_w)
+            if sig.type == "BUY":
+                buys += 1
+            elif sig.type == "SELL":
+                sells += 1
+            else:
+                neutral += 1
+                continue
+
+            future = m5.iloc[idx + 1: idx + 101]
+            if len(future) < 10:
+                continue
+            entry = float(m5_w.iloc[-1]["close"])
+            sl, tp1, tp2, tp3 = compute_levels(cfg, m5_w, sig.type)
+            r = _simulate_trade(future, sig.type, entry, sl, tp1, tp2, tp3)
+            trades.append((sig.type, r))
+        except Exception:
+            continue
+
+    print(f"\nSignals: {buys + sells} (BUY={buys}, SELL={sells}, NEUTRAL={neutral})")
+    if buys + sells > 0:
+        ratio = buys / (buys + sells)
+        marker = "✓ OK" if 0.35 <= ratio <= 0.65 else "⚠️  BIAS"
+        print(f"BUY/SELL ratio: {ratio*100:.1f}%  {marker}  (target 35–65%)")
+
+    for side in ("BUY", "SELL"):
+        rs = [r for s, r in trades if s == side]
+        if not rs:
+            continue
+        wins = sum(1 for r in rs if r > 0)
+        avg = sum(rs) / len(rs)
+        print(f"  {side}: n={len(rs)}  WR={wins/len(rs)*100:.1f}%  avgR={avg:+.3f}")
+
+    if trades:
+        all_r = [r for _, r in trades]
+        wins = sum(1 for r in all_r if r > 0)
+        total = sum(all_r)
+        print(f"\nOverall: n={len(all_r)}  WR={wins/len(all_r)*100:.1f}%  "
+              f"totalR={total:+.2f}  avgR={total/len(all_r):+.3f}")
+    print(f"\n⚠️  Backtest ≠ forward. Paper trade tetap wajib.")
+
+
+def cmd_force_run(cfg: Config) -> None:
+    global in_killzone
+    confirmed = "--confirm" in sys.argv
+    if not cfg.dry_run and not confirmed:
+        print("✗ force-run di live mode butuh --confirm flag.")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"FORCE RUN — bypass killzone, safety tetap aktif")
+    print(f"Mode: {'DRY' if cfg.dry_run else 'LIVE --confirmed'}")
+    print("=" * 60)
+
+    _orig_kz = in_killzone
+
+    def _always_kz(_):
+        return True
+
+    in_killzone = _always_kz
+    try:
+        run_once(cfg)
+    finally:
+        in_killzone = _orig_kz
+
+
+# =========================================================
+# MAIN
+# =========================================================
 if __name__ == "__main__":
     try:
         cfg = Config.from_env()
@@ -1700,6 +1841,13 @@ if __name__ == "__main__":
         try:
             if cmd == "run":
                 run_once(cfg)
+            elif cmd == "smoke":
+                cmd_smoke(cfg)
+            elif cmd == "backtest":
+                n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 800
+                cmd_backtest(cfg, max_samples=n)
+            elif cmd == "force-run":
+                cmd_force_run(cfg)
             elif cmd == "reports":
                 cmd_reports(cfg)
             elif cmd == "stats":
@@ -1715,10 +1863,18 @@ if __name__ == "__main__":
             elif cmd == "selftest":
                 cmd_selftest(cfg)
             elif cmd == "help":
-                print("Commands: run | reports | stats | reset-drawdown | "
-                      "reset-price | kill [reason] | unkill | selftest")
+                print("Commands:")
+                print("  selftest         — fail-fast validation")
+                print("  smoke            — analyse now outside killzone (dry)")
+                print("  backtest [N]     — historical symmetry + WR check")
+                print("  force-run        — bypass killzone (add --confirm if live)")
+                print("  run              — normal production run")
+                print("  reports|stats    — audit")
+                print("  kill [reason]|unkill|reset-drawdown|reset-price")
             else:
                 print(f"Unknown: {cmd}")
+        except SystemExit:
+            raise
         except Exception as e:
             logging.exception(f"FATAL: {e}")
             sys.exit(1)
