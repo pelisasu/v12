@@ -3,7 +3,7 @@ APEX PREDATOR v12.1 — BATTLE-READY
 ====================================
 All P0/P1/P2 patches from v12.0 PLUS v12.1 fixes:
   - Selftest exit code correct (fail-fast in CI)
-  - New commands: smoke, backtest, force-run
+  - New commands: smoke, backtest, force-run, test-tg
   - Cron-optimized workflow
 """
 from __future__ import annotations
@@ -1821,6 +1821,20 @@ def cmd_force_run(cfg: Config) -> None:
         in_killzone = _orig_kz
 
 
+def cmd_test_tg(cfg: Config) -> None:
+    print("=== TEST TELEGRAM INTEGRATION ===")
+    kv = KVStore(cfg)
+    msg = (f"<b>🔔 TEST MESSAGE — APEX v{VERSION}</b>\n\n"
+           f"Jika Anda menerima pesan ini, integrasi Telegram <b>BERHASIL</b>! ✅\n"
+           f"Bot siap tempur menunggu sinyal SMC.")
+    ok = tg_send(cfg, msg, kv)
+    if ok:
+        print("✓ Test message SENT. Cek HP Anda.")
+    else:
+        print("✗ Test message FAILED. Cek TOKEN & CHAT_ID di GitHub Secrets.")
+        sys.exit(1)
+
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -1848,6 +1862,8 @@ if __name__ == "__main__":
                 cmd_backtest(cfg, max_samples=n)
             elif cmd == "force-run":
                 cmd_force_run(cfg)
+            elif cmd == "test-tg":
+                cmd_test_tg(cfg)
             elif cmd == "reports":
                 cmd_reports(cfg)
             elif cmd == "stats":
@@ -1865,6 +1881,7 @@ if __name__ == "__main__":
             elif cmd == "help":
                 print("Commands:")
                 print("  selftest         — fail-fast validation")
+                print("  test-tg          — force send test message to Telegram")
                 print("  smoke            — analyse now outside killzone (dry)")
                 print("  backtest [N]     — historical symmetry + WR check")
                 print("  force-run        — bypass killzone (add --confirm if live)")
