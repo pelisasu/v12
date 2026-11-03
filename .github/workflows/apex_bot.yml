@@ -2,11 +2,8 @@ name: APEX Bot v12
 
 on:
   schedule:
-    # :02,:17,:32,:47 — hindari peak congestion; 2 menit setelah bar close
-    # Berjalan otomatis setiap 15 menit pada jam trading (UTC)
     - cron: "2,17,32,47 6-10,12-16,17-21 * * 1-5"
   workflow_dispatch:
-    # Memungkinkan Anda menekan tombol "Run workflow" secara manual
 
 concurrency:
   group: apex-bot-v12
@@ -43,26 +40,18 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
         
-      # 1. WAJIB PASSED: Jika ini gagal, bot tidak akan lanjut ke step berikutnya
       - name: Selftest (fail-fast)
         run: python apex_v12.py selftest
         
-      # 2. UJI COBA: Analisa market saat ini (tanpa kirim TG, tanpa tulis jurnal)
-      # Sangat berguna untuk melihat apakah sinyal terdeteksi di luar jam trading
+      - name: Test Telegram Connection
+        run: python apex_v12.py test-tg
+        
       - name: Smoke Test (Analisa Market)
         run: python apex_v12.py smoke
         
-      # 3. UJI COBA: Paksa jalan dan kirim pesan ke Telegram
-      # Ini akan mengabaikan filter jam (killzone) tapi tetap menggunakan mode DRY RUN
-      - name: Force Run (Uji Kirim Telegram)
-        run: python apex_v12.py force-run
-        
-      # 4. EKSEKUSI NORMAL: Ini yang berjalan otomatis via cron
-      # Jika dijalankan manual di luar jam trading, step ini akan log "Outside killzone"
       - name: Production Run
         run: python apex_v12.py run
         
-      # 5. LAPORAN: Selalu tampilkan status terakhir
       - name: Journal snapshot
         if: always()
         run: python apex_v12.py reports | head -n 20
