@@ -3,7 +3,8 @@ name: APEX Bot v16
 on:
   schedule:
     # 4 signal checks / jam selama window London+NY (06:00–21:00 UTC, Sen–Jum)
-    # Killzone internal script akan filter lebih lanjut (07–10 London, 08–11 & 13–16 NY)
+    # Killzone internal script akan filter lebih lanjut
+    # (07–10 London, 08–11 & 13–16 NY)
     - cron: "2,17,32,47 6-21 * * 1-5"
 
   workflow_dispatch:
@@ -34,7 +35,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15          # v15: 10 — ML v16 lebih berat (purging + triple-barrier)
+    timeout-minutes: 15          # ML v16 + triple-barrier + retry HTTP
     env:
       TZ: UTC
 
@@ -44,44 +45,72 @@ jobs:
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       GIST_ID:             ${{ secrets.GIST_ID }}
       GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
-      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # opsional
+      OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}   # opsional (offset dinamis)
 
-      # ── Kill switch & mode (repo VARIABLES, bukan secrets) ─
+      # ── Kill switch & mode (repo VARIABLES) ────────────────
       APEX_KILL:    ${{ vars.APEX_KILL || 'false' }}
       APEX_DRY_RUN: ${{ github.event.inputs.live_override == 'true' && 'false' || (vars.APEX_DRY_RUN || 'true') }}
 
       # ── Akun & Risk ────────────────────────────────────────
-      APEX_ACCOUNT_BALANCE:            "1000"
-      APEX_MAX_RISK_PCT_PER_TRADE:     "2.0"      # turunkan ke 0.5 untuk 20 trade pertama
-      APEX_HARD_LEVERAGE_CAP:          "50"
-      APEX_MAX_DAILY_LOSS_PCT:         "4.0"
-      APEX_MAX_CONSECUTIVE_LOSSES:     "3"
-      APEX_MAX_DAILY_SIGNALS:          "5"
-      APEX_DD_PAUSE_HOURS:             "24"
+      APEX_ACCOUNT_BALANCE:        "1000"
+      APEX_MAX_RISK_PCT_PER_TRADE: "2.0"      # turunkan ke 0.5 untuk 20 trade pertama
+      APEX_HARD_LEVERAGE_CAP:      "50"
+      APEX_MAX_DAILY_LOSS_PCT:     "4.0"
+      APEX_MAX_CONSECUTIVE_LOSSES: "3"
+      APEX_MAX_DAILY_SIGNALS:      "5"
+      APEX_DD_PAUSE_HOURS:         "24"
+
+      # ── ATR SL/TP (matematika risiko) ──────────────────────
+      APEX_ATR_SL_MULT:    "1.8"
+      APEX_ATR_TP1_MULT:   "1.0"
+      APEX_ATR_TP2_MULT:   "2.4"
+      APEX_ATR_TP3_MULT:   "4.0"
+      APEX_SPREAD_BUFFER:  "0.35"
+
+      # ── Entry limit semantics ──────────────────────────────
+      APEX_ENTRY_PULLBACK_ATR: "0.30"
+      APEX_ENTRY_MAX_CHASE_ATR: "3.0"
 
       # ── Data ───────────────────────────────────────────────
-      APEX_M5_FETCH_SIZE:              "800"      # TD free-tier safe cap (fix D-2)
-      APEX_MIN_BARS_M5:                "100"
-      APEX_MIN_BARS_H1:                "100"
-      APEX_MIN_BARS_H4:                "50"
-      APEX_MAX_STALE_MULT:             "3.0"
-      APEX_MT5_OFFSET:                 "0.0"
+      APEX_M5_FETCH_SIZE:   "800"      # TD free-tier safe cap
+      APEX_MIN_BARS_M5:     "100"
+      APEX_MIN_BARS_M15:    "100"
+      APEX_MIN_BARS_H1:     "100"
+      APEX_MIN_BARS_H4:     "50"
+      APEX_MAX_STALE_MULT:  "3.0"
+      APEX_MT5_OFFSET:      "0.0"
+      APEX_PRICE_MIN:       "500.0"
+      APEX_PRICE_MAX:       "10000.0"
+      APEX_PRICE_MAX_JUMP_PCT: "0.10"
 
       # ── Parliament ─────────────────────────────────────────
-      APEX_ADX_MIN:                    "22.0"
-      APEX_PARLIAMENT_MIN_ACTIVE:      "8"
-      APEX_PARLIAMENT_MIN_RATIO:       "0.55"
-      APEX_PARLIAMENT_HALF_RATIO:      "0.65"
-      APEX_PARLIAMENT_FULL_RATIO:      "0.75"
+      APEX_ADX_MIN:                  "22.0"
+      APEX_PARLIAMENT_MIN_ACTIVE:    "8"
+      APEX_PARLIAMENT_MIN_RATIO:     "0.55"
+      APEX_PARLIAMENT_HALF_RATIO:    "0.65"
+      APEX_PARLIAMENT_FULL_RATIO:    "0.75"
+      APEX_HURST_TREND_MIN:          "0.55"
+      APEX_HURST_MEANREV_MAX:        "0.45"
+      APEX_ENTROPY_CHAOS_MAX:        "0.85"
 
-      # ── ML (v16 baru) ──────────────────────────────────────
-      APEX_ML_USE_TRIPLE_BARRIER:      "true"
-      APEX_ML_PURGE_BARS:              "10"
-      APEX_ML_MIN_VAL_ACC:             "0.53"
+      # ── Cooldown ───────────────────────────────────────────
+      APEX_COOLDOWN_MINUTES:          "45"
+      APEX_OPPOSITE_COOLDOWN_MINUTES: "120"
+
+      # ── ML (v16) ───────────────────────────────────────────
+      APEX_ML_USE_TRIPLE_BARRIER: "true"
+      APEX_ML_PURGE_BARS:         "10"
+      APEX_ML_MIN_VAL_ACC:        "0.53"
 
       # ── News blackout ──────────────────────────────────────
-      APEX_NEWS_BLACKOUT_MIN:          "30"
-      APEX_NEWS_CACHE_SEC:             "1800"
+      APEX_NEWS_BLACKOUT_MIN:      "30"
+      APEX_NEWS_CACHE_SEC:         "1800"
+      APEX_NEWS_CACHE_SEC_ON_FAIL: "300"
+
+      # ── Journal / HTTP ─────────────────────────────────────
+      APEX_MAX_JOURNAL:          "500"
+      APEX_PENDING_MAX_AGE_HOURS: "24"
+      APEX_MAX_RETRY:            "3"
 
     steps:
       - name: Checkout
