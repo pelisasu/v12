@@ -1,28 +1,28 @@
-name: v18.0
+name: APEX PREDATOR v18.0
 
 # ════════════════════════════════════════════════════════════
 # TRIGGER
 # ════════════════════════════════════════════════════════════
 on:
-  # Jadwal otomatis — tiap 5 menit (killzone difilter di kode)
+  # Produksi: tiap 5 menit. dry/live dikontrol repo variable
+  # "APEX_LIVE_ENABLED" (Settings → Variables).
   schedule:
     - cron: '*/5 * * * *'
 
-  # Manual dari tab Actions
+  # Manual: pilih stage → seluruh sequence-nya jalan otomatis
   workflow_dispatch:
     inputs:
-      command:
-        description: 'Perintah yang dijalankan'
+      stage:
+        description: 'Pilih tahap testing'
         required: true
-        default: 'smoke'
+        default: 'full_validation'
         type: choice
         options:
-          - run
-          - smoke
-          - selftest
-          - test-tg
+          - full_validation    # selftest → test-tg → smoke → run(dry)
+          - live_promote       # selftest → run(LIVE) — kirim sinyal nyata
+          - smoke_only         # smoke saja (fetch data + parliament)
+          - selftest_only      # selftest saja (validasi config)
 
-  # Validasi saat push (hanya smoke test, tidak kirim sinyal)
   push:
     branches: [main, master]
     paths:
@@ -35,20 +35,20 @@ on:
 permissions:
   contents: read
 
-# Hindari run paralel (race condition di Gist)
 concurrency:
   group: apex-predator-v18
   cancel-in-progress: false
 
 # ════════════════════════════════════════════════════════════
-# JOB UTAMA — RUN APEX
+# JOB 1 — MANUAL (workflow_dispatch)
+# Sequence lengkap berdasarkan stage yang dipilih
 # ════════════════════════════════════════════════════════════
 jobs:
-  apex:
-    name: APEX v18 Run
+  apex-manual:
+    name: APEX Manual — ${{ github.event.inputs.stage }}
     runs-on: ubuntu-latest
-    timeout-minutes: 8
-    if: github.event_name != 'push'
+    timeout-minutes: 15
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: 📥 Checkout
@@ -59,7 +59,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ── Requirements embedded (single-file setup) ──
       - name: 📚 Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -70,7 +69,6 @@ jobs:
             "scikit-learn>=1.3" \
             "scipy>=1.11"
 
-      # Sanity check import sebelum lanjut
       - name: 🔎 Verify imports
         run: |
           python - <<'PY'
@@ -82,14 +80,57 @@ jobs:
           print("scipy    ", scipy.__version__)
           PY
 
-      - name: 🧪 Selftest (wajib lulus)
+      # ─────────────────────────────────────────────
+      # STEP 1 — SELFTEST (validasi config)
+      # ─────────────────────────────────────────────
+      - name: "1️⃣  Selftest — validasi config"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'live_promote' ||
+          github.event.inputs.stage == 'selftest_only'
         env:
-          APEX_DRY_RUN: 'false'
-        run: python apex_v18.py selftest
+          APEX_DRY_RUN: 'true'
+        run: |
+          echo "::group::selftest"
+          python apex_v18.py selftest
+          echo "::endgroup::"
 
-      - name: 🚀 Execute command
+      # ─────────────────────────────────────────────
+      # STEP 2 — TEST-TG (kirim 1 test message)
+      # ─────────────────────────────────────────────
+      - name: "2️⃣  Test Telegram — pastikan bot bisa kirim"
+        if: github.event.inputs.stage == 'full_validation'
         env:
-          # ─── Secrets (Settings → Secrets → Actions) ───
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APEX_DRY_RUN:     'false'   # test-tg harus kirim nyata
+        run: |
+          echo "::group::test-tg"
+          python apex_v18.py test-tg
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────
+      # STEP 3 — SMOKE (fetch + parliament, tanpa sinyal)
+      # ─────────────────────────────────────────────
+      - name: "3️⃣  Smoke — fetch data + parliament vote"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'smoke_only'
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}
+          APEX_DRY_RUN:        'true'
+        run: |
+          echo "::group::smoke"
+          python apex_v18.py smoke
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────
+      # STEP 4 — RUN DRY (pipeline penuh, tanpa kirim TG)
+      # ─────────────────────────────────────────────
+      - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
+        if: github.event.inputs.stage == 'full_validation'
+        env:
           GIST_ID:              ${{ secrets.GIST_ID }}
           GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
           TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
@@ -97,8 +138,37 @@ jobs:
           OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
           TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
 
-          # ─── Runtime config (override sesuai kebutuhan) ───
-          APEX_DRY_RUN:                     'false'
+          APEX_DRY_RUN:                     'true'   # ← hanya log
+          APEX_SYMBOL:                      'XAUUSD'
+          APEX_ACCOUNT_BALANCE:             '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
+          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
+          APEX_MAX_DAILY_SIGNALS:           '5'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_ENABLE_ML_MODELS:            'true'
+          APEX_MT5_OFFSET:                  '0.0'
+          APEX_KILL_SWITCH:                 'false'
+          APEX_SKIP_KILLZONE_FILTER:        'true'   # ← test di luar jam
+        run: |
+          echo "::group::run (dry)"
+          python apex_v18.py run
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────
+      # STEP 5 — RUN LIVE (sinyal nyata ke Telegram)
+      # ─────────────────────────────────────────────
+      - name: "5️⃣  Run LIVE — kirim sinyal nyata"
+        if: github.event.inputs.stage == 'live_promote'
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+
+          APEX_DRY_RUN:                     'false'  # ← kirim nyata
           APEX_SYMBOL:                      'XAUUSD'
           APEX_ACCOUNT_BALANCE:             '1000'
           APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
@@ -110,9 +180,9 @@ jobs:
           APEX_MT5_OFFSET:                  '0.0'
           APEX_KILL_SWITCH:                 'false'
         run: |
-          CMD="${{ github.event.inputs.command || 'run' }}"
-          echo "▶️ python apex_v18.py $CMD"
-          python apex_v18.py "$CMD"
+          echo "::group::run (live)"
+          python apex_v18.py run
+          echo "::endgroup::"
 
       - name: 📋 Upload state artifact
         if: always()
@@ -123,25 +193,87 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: 🧾 Run summary
+      - name: 🧾 Summary
         if: always()
         run: |
           {
-            echo "### APEX v18.0 Run"
+            echo "### APEX v18.0 — Manual Test"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Event | \`${{ github.event_name }}\` |"
-            echo "| Command | \`${{ github.event.inputs.command || 'run' }}\` |"
+            echo "| Stage | \`${{ github.event.inputs.stage }}\` |"
             echo "| Status | ${{ job.status }} |"
             echo "| Time | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
           } >> $GITHUB_STEP_SUMMARY
 
 # ════════════════════════════════════════════════════════════
-# JOB VALIDASI — hanya jalan saat push
+# JOB 2 — SCHEDULE (cron, tiap 5 menit)
+# dry/live via repo variable APEX_LIVE_ENABLED
+# ════════════════════════════════════════════════════════════
+  apex-schedule:
+    name: APEX Scheduled Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            "numpy>=1.24,<3" \
+            "pandas>=2.0,<3" \
+            "requests>=2.31" \
+            "scikit-learn>=1.3" \
+            "scipy>=1.11"
+
+      - name: 🧪 Selftest
+        run: python apex_v18.py selftest
+
+      - name: 🚀 Scheduled run
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+
+          # dry=false hanya jika user set repo variable APEX_LIVE_ENABLED=true
+          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
+
+          APEX_SYMBOL:                      'XAUUSD'
+          APEX_ACCOUNT_BALANCE:             '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
+          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
+          APEX_MAX_DAILY_SIGNALS:           '5'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_ENABLE_ML_MODELS:            'true'
+          APEX_MT5_OFFSET:                  '0.0'
+          APEX_KILL_SWITCH:                 'false'
+        run: python apex_v18.py run
+
+      - name: 📋 Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-sched-${{ github.run_number }}
+          path: apex_state_v18.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+# ════════════════════════════════════════════════════════════
+# JOB 3 — VALIDATION ON PUSH (hanya smoke, tanpa sinyal)
 # ════════════════════════════════════════════════════════════
   validate-on-push:
-    name: Validate on Push (smoke)
+    name: Validate on Push
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.event_name == 'push'
@@ -166,7 +298,7 @@ jobs:
       - name: 🧪 Selftest
         run: python apex_v18.py selftest
 
-      - name: 💨 Smoke test
+      - name: 💨 Smoke
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}
