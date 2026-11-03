@@ -4,12 +4,9 @@ name: APEX PREDATOR v18.0
 # TRIGGER
 # ════════════════════════════════════════════════════════════
 on:
-  # Produksi: tiap 5 menit. dry/live dikontrol repo variable
-  # "APEX_LIVE_ENABLED" (Settings → Variables).
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
 
-  # Manual: pilih stage → seluruh sequence-nya jalan otomatis
   workflow_dispatch:
     inputs:
       stage:
@@ -19,9 +16,9 @@ on:
         type: choice
         options:
           - full_validation    # selftest → test-tg → smoke → run(dry)
-          - live_promote       # selftest → run(LIVE) — kirim sinyal nyata
-          - smoke_only         # smoke saja (fetch data + parliament)
-          - selftest_only      # selftest saja (validasi config)
+          - live_promote       # selftest → run(LIVE)
+          - smoke_only         # smoke saja
+          - selftest_only      # selftest saja
 
   push:
     branches: [main, master]
@@ -40,8 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 # ════════════════════════════════════════════════════════════
-# JOB 1 — MANUAL (workflow_dispatch)
-# Sequence lengkap berdasarkan stage yang dipilih
+# JOB 1 — MANUAL
 # ════════════════════════════════════════════════════════════
 jobs:
   apex-manual:
@@ -81,7 +77,7 @@ jobs:
           PY
 
       # ─────────────────────────────────────────────
-      # STEP 1 — SELFTEST (validasi config)
+      # STEP 1 — SELFTEST
       # ─────────────────────────────────────────────
       - name: "1️⃣  Selftest — validasi config"
         if: |
@@ -96,21 +92,21 @@ jobs:
           echo "::endgroup::"
 
       # ─────────────────────────────────────────────
-      # STEP 2 — TEST-TG (kirim 1 test message)
+      # STEP 2 — TEST-TG
       # ─────────────────────────────────────────────
-      - name: "2️⃣  Test Telegram — pastikan bot bisa kirim"
+      - name: "2️⃣  Test Telegram"
         if: github.event.inputs.stage == 'full_validation'
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          APEX_DRY_RUN:     'false'   # test-tg harus kirim nyata
+          APEX_DRY_RUN:     'false'
         run: |
           echo "::group::test-tg"
           python apex_v18.py test-tg
           echo "::endgroup::"
 
       # ─────────────────────────────────────────────
-      # STEP 3 — SMOKE (fetch + parliament, tanpa sinyal)
+      # STEP 3 — SMOKE
       # ─────────────────────────────────────────────
       - name: "3️⃣  Smoke — fetch data + parliament vote"
         if: |
@@ -126,7 +122,7 @@ jobs:
           echo "::endgroup::"
 
       # ─────────────────────────────────────────────
-      # STEP 4 — RUN DRY (pipeline penuh, tanpa kirim TG)
+      # STEP 4 — RUN DRY  (news filter DISABLED untuk test)
       # ─────────────────────────────────────────────
       - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
         if: github.event.inputs.stage == 'full_validation'
@@ -138,25 +134,25 @@ jobs:
           OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
           TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
 
-          APEX_DRY_RUN:                     'true'   # ← hanya log
+          APEX_DRY_RUN:                     'true'
           APEX_SYMBOL:                      'XAUUSD'
           APEX_ACCOUNT_BALANCE:             '1000'
           APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
           APEX_MAX_DAILY_LOSS_PCT:          '3.0'
           APEX_MAX_CONSECUTIVE_LOSSES:      '3'
           APEX_MAX_DAILY_SIGNALS:           '5'
-          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_NEWS_BLACKOUT_MIN:           '0'
           APEX_ENABLE_ML_MODELS:            'true'
           APEX_MT5_OFFSET:                  '0.0'
           APEX_KILL_SWITCH:                 'false'
-          APEX_SKIP_KILLZONE_FILTER:        'true'   # ← test di luar jam
+          APEX_SKIP_KILLZONE_FILTER:        'true'
         run: |
           echo "::group::run (dry)"
           python apex_v18.py run
           echo "::endgroup::"
 
       # ─────────────────────────────────────────────
-      # STEP 5 — RUN LIVE (sinyal nyata ke Telegram)
+      # STEP 5 — RUN LIVE
       # ─────────────────────────────────────────────
       - name: "5️⃣  Run LIVE — kirim sinyal nyata"
         if: github.event.inputs.stage == 'live_promote'
@@ -168,7 +164,7 @@ jobs:
           OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
           TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
 
-          APEX_DRY_RUN:                     'false'  # ← kirim nyata
+          APEX_DRY_RUN:                     'false'
           APEX_SYMBOL:                      'XAUUSD'
           APEX_ACCOUNT_BALANCE:             '1000'
           APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
@@ -207,8 +203,7 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
 
 # ════════════════════════════════════════════════════════════
-# JOB 2 — SCHEDULE (cron, tiap 5 menit)
-# dry/live via repo variable APEX_LIVE_ENABLED
+# JOB 2 — SCHEDULE
 # ════════════════════════════════════════════════════════════
   apex-schedule:
     name: APEX Scheduled Run
@@ -245,7 +240,6 @@ jobs:
           OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
           TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
 
-          # dry=false hanya jika user set repo variable APEX_LIVE_ENABLED=true
           APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
 
           APEX_SYMBOL:                      'XAUUSD'
@@ -270,7 +264,7 @@ jobs:
           if-no-files-found: ignore
 
 # ════════════════════════════════════════════════════════════
-# JOB 3 — VALIDATION ON PUSH (hanya smoke, tanpa sinyal)
+# JOB 3 — VALIDATION ON PUSH
 # ════════════════════════════════════════════════════════════
   validate-on-push:
     name: Validate on Push
