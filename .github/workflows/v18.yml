@@ -1,8 +1,5 @@
 name: APEX PREDATOR v18.0
 
-# ════════════════════════════════════════════════════════════
-# TRIGGER
-# ════════════════════════════════════════════════════════════
 on:
   schedule:
     - cron: '*/15 * * * *'
@@ -26,9 +23,6 @@ on:
       - 'apex_v18.py'
       - '.github/workflows/apex.yml'
 
-# ════════════════════════════════════════════════════════════
-# PERMISSIONS & CONCURRENCY
-# ════════════════════════════════════════════════════════════
 permissions:
   contents: read
 
@@ -36,9 +30,6 @@ concurrency:
   group: apex-predator-v18
   cancel-in-progress: false
 
-# ════════════════════════════════════════════════════════════
-# JOB 1 — MANUAL
-# ════════════════════════════════════════════════════════════
 jobs:
   apex-manual:
     name: APEX Manual — ${{ github.event.inputs.stage }}
@@ -76,7 +67,6 @@ jobs:
           print("scipy    ", scipy.__version__)
           PY
 
-      # ─── STEP 1 — SELFTEST ───
       - name: "1️⃣  Selftest — validasi config"
         if: |
           github.event.inputs.stage == 'full_validation' ||
@@ -89,7 +79,6 @@ jobs:
           python apex_v18.py selftest
           echo "::endgroup::"
 
-      # ─── STEP 2 — TEST-TG ───
       - name: "2️⃣  Test Telegram"
         if: github.event.inputs.stage == 'full_validation'
         env:
@@ -101,7 +90,6 @@ jobs:
           python apex_v18.py test-tg
           echo "::endgroup::"
 
-      # ─── STEP 3 — SMOKE ───
       - name: "3️⃣  Smoke — fetch data + parliament vote"
         if: |
           github.event.inputs.stage == 'full_validation' ||
@@ -115,7 +103,6 @@ jobs:
           python apex_v18.py smoke
           echo "::endgroup::"
 
-      # ─── STEP 4 — RUN DRY ───
       - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
         if: github.event.inputs.stage == 'full_validation'
         env:
@@ -143,7 +130,6 @@ jobs:
           python apex_v18.py run
           echo "::endgroup::"
 
-      # ─── STEP 5 — RUN LIVE ───
       - name: "5️⃣  Run LIVE — kirim sinyal nyata"
         if: github.event.inputs.stage == 'live_promote'
         env:
@@ -192,9 +178,6 @@ jobs:
             echo "| Time | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
           } >> $GITHUB_STEP_SUMMARY
 
-# ════════════════════════════════════════════════════════════
-# JOB 2 — SCHEDULE
-# ════════════════════════════════════════════════════════════
   apex-schedule:
     name: APEX Scheduled Run
     runs-on: ubuntu-latest
@@ -253,9 +236,6 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-# ════════════════════════════════════════════════════════════
-# JOB 3 — VALIDATION ON PUSH
-# ════════════════════════════════════════════════════════════
   validate-on-push:
     name: Validate on Push
     runs-on: ubuntu-latest
