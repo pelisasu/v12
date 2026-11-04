@@ -2,7 +2,8 @@
 """
 APEX PREDATOR v18.0 — Production Institutional Hardened
 ========================================================
-OOP architecture with fail-safe layers. See CHANGELOG.
+OOP architecture with multi-provider failover:
+  TwelveData → XAUS API → Biquote → Yahoo Finance
 """
 from __future__ import annotations
 
@@ -383,7 +384,7 @@ class Indicators:
 
 
 # ════════════════════════════════════════════════════════════
-# MARKET DATA HANDLER
+# MARKET DATA HANDLER (4-provider failover)
 # ════════════════════════════════════════════════════════════
 class MarketDataHandler:
     def __init__(self, cfg: Config, http: HTTPClient, kv: KVStore):
@@ -392,6 +393,7 @@ class MarketDataHandler:
         self.kv = kv
         self._last_td_call = 0.0
 
+    # ---------- validation ----------
     def _validate(self, df: pd.DataFrame, name: str, min_bars: int) -> None:
         if df is None or len(df) < min_bars:
             raise DataFetchError(f"{name}: {0 if df is None else len(df)} < {min_bars} bars")
@@ -418,6 +420,7 @@ class MarketDataHandler:
         if age_min > self.cfg.max_stale_mult * tf_minutes:
             raise DataFetchError(f"{name}: stale {age_min:.0f}min old")
 
+    # ---------- offset ----------
     def _compute_offset(self) -> float:
         oanda_key = os.getenv("OANDA_API_KEY", "").strip()
         td_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
@@ -465,6 +468,7 @@ class MarketDataHandler:
               .reset_index()
         )
 
+    # ---------- TD rate limit + cache ----------
     def _rate_limit_td(self) -> None:
         elapsed = time.time() - self._last_td_call
         wait = self.cfg.td_min_interval_sec - elapsed
@@ -535,6 +539,7 @@ class MarketDataHandler:
 
         return self._apply_offset(df, offset)
 
+    # ---------- TwelveData ----------
     def _fetch_td(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
         key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
         if not key:
@@ -555,6 +560,107 @@ class MarketDataHandler:
         self._validate(m15, "TD-M15", self.cfg.min_bars_m15)
         return {"5min": m5, "15min": m15, "1h": h1, "4h": h4}, "TwelveData"
 
+    # ---------- XAUS API (keyless) ----------
+    def _fetch_xaus(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
+        base = "https://xaus.com/api/v1/chart"
+        headers = {"Accept": "application/json"}
+
+        def fetch(interval: str, rng: str) -> pd.DataFrame:
+            r = self.http.request(
+                "GET", base,
+                params={"symbol": "xau", "interval": interval, "range": rng},
+                headers=headers,
+            )
+            data = r.json()
+            points = data.get("points")
+            if not points:
+                raise DataFetchError(f"XAUS {interval}: no points")
+            rows = []
+            for p in points:
+                if not all(k in p for k in ("t", "o", "h", "l", "c")):
+                    continue
+                rows.append({
+                    "epoch": int(p["t"]),
+                    "open": float(p["o"]), "high": float(p["h"]),
+                    "low": float(p["l"]), "close": float(p["c"]),
+                    "volume": float(p.get("v", 100.0) or 100.0),
+                })
+            if not rows:
+                raise DataFetchError(f"XAUS {interval}: 0 valid rows")
+            df = pd.DataFrame(rows)
+            df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+            df = df[["datetime", "open", "high", "low", "close", "volume"]]
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return self._apply_offset(df, offset)
+
+        m5 = fetch("5m", "5d")
+        h1 = fetch("1h", "1mo")
+        h4 = self._apply_offset(self._resample(h1, "4h"), offset)
+
+        self._validate(m5, "XAUS-M5", self.cfg.min_bars_m5)
+        self._validate(h1, "XAUS-H1", self.cfg.min_bars_h1)
+        self._validate(h4, "XAUS-H4", self.cfg.min_bars_h4)
+        self._check_staleness(m5, 5, "XAUS-M5")
+        self._check_staleness(h1, 60, "XAUS-H1")
+        self._check_staleness(h4, 240, "XAUS-H4")
+        m15 = self._apply_offset(self._resample(m5, "15min"), offset)
+        self._validate(m15, "XAUS-M15", self.cfg.min_bars_m15)
+        return {"5min": m5, "15min": m15, "1h": h1, "4h": h4}, "XAUS"
+
+    # ---------- Biquote (keyless) ----------
+    def _fetch_biquote(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
+        base = "https://biquote.io/api/XAUUSD/ohlc"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
+
+        def fetch(interval: str, limit: int = 800) -> pd.DataFrame:
+            r = self.http.request(
+                "GET", base,
+                params={"interval": interval, "limit": limit},
+                headers=headers,
+            )
+            data = r.json()
+            bars = data.get("bars")
+            if not bars:
+                raise DataFetchError(f"BQ {interval}: no bars")
+            rows = []
+            for b in bars:
+                if "openTime" not in b:
+                    continue
+                rows.append({
+                    "datetime": b["openTime"],
+                    "open": float(b["open"]), "high": float(b["high"]),
+                    "low": float(b["low"]), "close": float(b["close"]),
+                    "volume": float(b.get("tickVolume", 100.0) or 100.0),
+                })
+            if not rows:
+                raise DataFetchError(f"BQ {interval}: 0 valid rows")
+            df = pd.DataFrame(rows)
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return self._apply_offset(df, offset)
+
+        m5 = fetch("5m")
+        h1 = fetch("1h")
+        h4 = fetch("4h")
+
+        self._validate(m5, "BQ-M5", self.cfg.min_bars_m5)
+        self._validate(h1, "BQ-H1", self.cfg.min_bars_h1)
+        self._validate(h4, "BQ-H4", self.cfg.min_bars_h4)
+        self._check_staleness(m5, 5, "BQ-M5")
+        self._check_staleness(h1, 60, "BQ-H1")
+        self._check_staleness(h4, 240, "BQ-H4")
+        m15 = self._apply_offset(self._resample(m5, "15min"), offset)
+        self._validate(m15, "BQ-M15", self.cfg.min_bars_m15)
+        return {"5min": m5, "15min": m15, "1h": h1, "4h": h4}, "Biquote"
+
+    # ---------- Yahoo GC=F ----------
     def _fetch_yahoo(self, offset: float) -> Tuple[Dict[str, pd.DataFrame], str]:
         headers = {
             "User-Agent": (
@@ -616,10 +722,17 @@ class MarketDataHandler:
             self._check_staleness(out[tf], mins, f"YH-{tf}")
         return out, "Yahoo"
 
+    # ---------- public failover chain ----------
     def fetch_all(self) -> Tuple[Dict[str, pd.DataFrame], str, float]:
         offset = self._compute_offset()
+        providers = (
+            ("TwelveData", self._fetch_td),
+            ("XAUS", self._fetch_xaus),
+            ("Biquote", self._fetch_biquote),
+            ("Yahoo", self._fetch_yahoo),
+        )
         errors = []
-        for name, fn in (("TwelveData", self._fetch_td), ("Yahoo", self._fetch_yahoo)):
+        for name, fn in providers:
             try:
                 dfs, src = fn(offset)
                 logging.info(f"Data source: {src} | offset={offset:+.3f}")
