@@ -1,0 +1,96 @@
+name: APEX-QUANT-OMNI Crypto Signal Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [telegram_check]
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Mode eksekusi manual"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - check
+          - btc
+          - eth
+          - sniper
+          - scalp
+          - swing
+          - status
+          - chart
+          - history
+      tier_mode:
+        description: "Filter Tier Sinyal (BOTH = Pro + Sniper | SNIPER_ONLY = A+ Saja)"
+        required: false
+        default: "BOTH"
+        type: choice
+        options:
+          - BOTH
+          - SNIPER_ONLY
+          - PRO_ONLY
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apex-quant-omni-crypto
+  cancel-in-progress: false
+
+jobs:
+  run-signal-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore SQLite State & Persistence Cache
+        uses: actions/cache@v4
+        with:
+          path: trading_signals.db
+          key: apex-quant-crypto-state-${{ github.run_id }}
+          restore-keys: |
+            apex-quant-crypto-state-
+
+      - name: Execute APEX-QUANT-OMNI Engine
+        env:
+          PYTHONUNBUFFERED: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE || '10000.0' }}
+          RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT || '1.0' }}
+          BTC_CONTRACT_SIZE: ${{ vars.BTC_CONTRACT_SIZE || '1.0' }}
+          BTC_PIP_SIZE: ${{ vars.BTC_PIP_SIZE || '1.0' }}
+          ETH_CONTRACT_SIZE: ${{ vars.ETH_CONTRACT_SIZE || '1.0' }}
+          ETH_PIP_SIZE: ${{ vars.ETH_PIP_SIZE || '0.01' }}
+          BTC_PRICE_OFFSET: ${{ vars.BTC_PRICE_OFFSET || '0.0' }}
+          ETH_PRICE_OFFSET: ${{ vars.ETH_PRICE_OFFSET || '0.0' }}
+          CRYPTO_SPREAD_PCT: ${{ vars.CRYPTO_SPREAD_PCT || '0.0003' }}
+          CRYPTO_SLIPPAGE_PCT: ${{ vars.CRYPTO_SLIPPAGE_PCT || '0.0001' }}
+          SIGNAL_TIER_MODE: ${{ github.event.inputs.tier_mode || vars.SIGNAL_TIER_MODE || 'BOTH' }}
+          BOT_COMMAND: ${{ github.event.inputs.command || github.event.client_payload.command || 'auto' }}
+        run: |
+          python -u bot.py
+
+      - name: Upload State DB & Backtest Performance Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-quant-cry
