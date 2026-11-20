@@ -53,20 +53,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install --upgrade pip && pip install pandas numpy requests yfinance matplotlib
 
-      - name: Restore SQLite State & Persistence Cache
+      - name: Restore SQLite State Cache
         uses: actions/cache@v4
         with:
           path: trading_signals.db
           key: apex-quant-crypto-state-${{ github.run_id }}
-          restore-keys: |
-            apex-quant-crypto-state-
+          restore-keys: apex-quant-crypto-state-
 
       - name: Execute APEX-QUANT-OMNI Engine
         env:
@@ -86,11 +82,20 @@ jobs:
           CRYPTO_SLIPPAGE_PCT: ${{ vars.CRYPTO_SLIPPAGE_PCT || '0.0001' }}
           SIGNAL_TIER_MODE: ${{ github.event.inputs.tier_mode || vars.SIGNAL_TIER_MODE || 'BOTH' }}
           BOT_COMMAND: ${{ github.event.inputs.command || github.event.client_payload.command || 'auto' }}
-        run: |
-          python -u bot.py
+        run: python -u bot.py
 
-      - name: Upload State DB & Backtest Performance Artifact
+      - name: Upload SQLite State DB
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apex-quant-cry
+          name: apex-quant-crypto-db-${{ github.run_number }}
+          path: trading_signals.db
+          retention-days: 14
+
+      - name: Upload Backtest Chart
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-quant-crypto-chart-${{ github.run_number }}
+          path: backtest_performance.png
+          retention-days: 14
